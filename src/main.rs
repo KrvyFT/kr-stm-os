@@ -28,10 +28,6 @@ fn main() -> ! {
         .unwrap();
 
     let (tx, rx) = serial.split();
-    let mut console = SerialConsole::new(tx, rx);
-    let mut i = 0;
-    loop {
-        let _ = writeln!(console, "{}", i);
-        i += 1;
-    }
+    console::init_console(SerialConsole::new(tx, rx));
+    loop {}
 }

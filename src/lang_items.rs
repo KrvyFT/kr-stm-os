@@ -1,12 +1,14 @@
-use core::{hint, panic::PanicInfo};
+use core::{fmt::Write, hint::spin_loop, panic::PanicInfo};
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
-    if let Some(location) = info.location() {
-        todo!()
-    } else {
-        todo!()
+    cortex_m::interrupt::disable();
+
+    if let Some(mut console) = crate::console::get_console() {
+        let _ = write!(console, "\r\n[kernel panic] {info}\r\n");
     }
 
-    todo!()
+    loop {
+        spin_loop();
+    }
 }
