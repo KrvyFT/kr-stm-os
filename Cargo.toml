@@ -13,5 +13,6 @@ bench = false
 [dependencies]
 cortex-m = "0.7.10"
 cortex-m-rt = "0.7.5"
+heapless = "0.9.3"
 nb = "1.1.0"
 stm32h7xx-hal = { version = "0.16.0", features = ["stm32h743v"] }

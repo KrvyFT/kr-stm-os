@@ -4,16 +4,14 @@
 mod console;
 mod lang_items;
 
-use core::fmt::Write;
 use cortex_m_rt::entry;
+use stm32h7xx_hal::dma::dma::StreamsTuple;
 use stm32h7xx_hal::time::U32Ext;
 use stm32h7xx_hal::{self as _, gpio::GpioExt, pac, pwr::PwrExt, rcc::RccExt, serial::SerialExt};
 
-use crate::console::SerialConsole;
-
 #[entry]
 fn main() -> ! {
-    let cp = cortex_m::Peripherals::take().unwrap();
+    let _cp = cortex_m::Peripherals::take().unwrap();
     let dp = pac::Peripherals::take().unwrap();
 
     let power = dp.PWR.constrain().freeze();
@@ -27,7 +25,11 @@ fn main() -> ! {
         .serial((tx, rx), 19_200.bps(), ccdr.peripheral.USART1, &ccdr.clocks)
         .unwrap();
 
-    let (tx, rx) = serial.split();
-    console::init_console(SerialConsole::new(tx, rx));
-    loop {}
+    let (tx, _rx) = serial.split();
+    let dma = StreamsTuple::new(dp.DMA1, ccdr.peripheral.DMA1);
+    let mut driver = console::ConsoleDriver::new(tx, dma.0);
+    let _ = console::try_print("kr-stm-os booted\r\n");
+    loop {
+        driver.poll();
+    }
 }
