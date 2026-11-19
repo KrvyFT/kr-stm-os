@@ -1,0 +1,5 @@
+{
+    "memory-view.trackDebuggers": [
+        "probe-rs-debug"
+    ]
+}

@@ -9,7 +9,7 @@
 | [`src/console.rs`](../src/console.rs) | 管理普通输出队列，通过 HAL 轮询发送，保存 DMA1 Stream 0 的所有权 |
 | [`src/console/panic_dma.rs`](../src/console/panic_dma.rs) | 在 panic 路径中格式化消息、维护 D-Cache 并直接操作 USART1 和 DMA 寄存器 |
 | [`src/panic_handler.rs`](../src/panic_handler.rs) | 从 `PanicInfo` 提取消息与源码位置，调用 panic 输出后自旋 |
-| [`memory.x`](../memory.x) 和 [`.cargo/config.toml`](../.cargo/config.toml) | 定义程序使用的内存区域、交叉编译目标和烧录 runner |
+| [`memory.x`](../memory.x)、[`build.rs`](../build.rs) 和 [`.cargo/config.toml`](../.cargo/config.toml) | 定义内核的内存区域和链接参数，以及项目的交叉编译目标和烧录 runner |
 
 `main.rs` 使用 `#![no_std]` 和 `#![no_main]`。复位后，`cortex-m-rt` 提供的启动代码准备 RAM 中的静态数据，包括初始化 `.data` 和清零 `.bss`，随后调用 `#[entry]` 指定的 `main()`。
 
@@ -19,7 +19,7 @@
 
 ## 链接与内存
 
-Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指令集和硬浮点 ABI。链接时，`-Tlink.x` 选择 `cortex-m-rt` 的链接脚本。脚本从 `memory.x` 读取以下区域：
+Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指令集和硬浮点 ABI。内核的 `build.rs` 只给 `kr-stm-os` 二进制传入 `-Tlink.x`，因此 workspace 中的 `user` 可以定义自己的链接布局。内核使用 `cortex-m-rt` 的链接脚本，从 `memory.x` 读取以下区域：
 
 | 区域 | 起始地址 | 项目使用范围 | 用途 |
 | --- | --- | --- | --- |

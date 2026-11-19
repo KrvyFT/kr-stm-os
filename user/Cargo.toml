@@ -1,0 +1,11 @@
+[package]
+name = "user"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+# The default bare-metal target has no standard test harness.
+test = false
+doctest = false
+bench = false
