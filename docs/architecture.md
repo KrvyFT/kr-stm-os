@@ -24,9 +24,12 @@ Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指
 | 区域 | 起始地址 | 项目使用范围 | 用途 |
 | --- | --- | --- | --- |
 | FLASH | `0x0800_0000` | 512 KiB | 向量表、程序代码、只读数据和 `.data` 的初始值 |
-| RAM | `0x2400_0000` | 512 KiB | AXI SRAM，存放 `.data`、`.bss` 和栈 |
+| 内核 RAM | `0x2400_0000` | 384 KiB | AXI SRAM，存放内核 `.data`、`.bss` 和栈 |
+| 应用 RAM | `0x2406_0000` | 128 KiB | AXI SRAM，由 [`user/link.x`](../user/link.x) 定义，各应用分时使用，顶部预留 4 KiB 栈 |
 
 panic 缓冲区位于 AXI SRAM 的 `.bss`。如果将来调整链接布局，需要继续把它放在 DMA1 可访问的内存，并保留 32 字节对齐。[DMA 缓冲区与缓存维护](dma-panic.md#3-准备-dma-能读到的消息)
+
+`cargo build --locked -p user --bin hello` 生成应用 ELF。应用以 [`_start`](../user/src/entry.s) 为入口，尾跳转至 Rust 的 `user_main`，把返回值留在 `r0`。后续加载器负责复制可加载段、清零零填充区域、设置应用栈和安排返回地址。`hello` 目前只返回 `0`，用于验证链接和入口。
 
 ## 普通串口输出
 

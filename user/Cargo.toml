@@ -9,3 +9,9 @@ publish = false
 test = false
 doctest = false
 bench = false
+
+[[bin]]
+name = "hello"
+path = "src/bin/hello.rs"
+test = false
+bench = false
