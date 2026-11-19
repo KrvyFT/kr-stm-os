@@ -38,3 +38,4 @@ panic 段带 ANSI 红色序列。启动期间 PC13 先被拉低，在启动消�
 
 - [代码结构与启动流程](docs/architecture.md) 说明模块职责、链接布局、控制台接口和验证方式。
 - [DMA panic 输出](docs/dma-panic.md) 说明缓冲区、缓存维护、寄存器顺序和板上观察点。
+- [批处理系统实施指南](docs/batch-implementation.md) 从 W25Q64JV 接线、烧录和装载讲到 Cortex-M7 应用切换及串口共享。
