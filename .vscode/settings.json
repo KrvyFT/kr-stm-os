@@ -1,4 +1,8 @@
 {
+    "rust-analyzer.linkedProjects": [
+        "Cargo.toml",
+        "tools/pack/Cargo.toml"
+    ],
     "memory-view.trackDebuggers": [
         "probe-rs-debug"
     ]

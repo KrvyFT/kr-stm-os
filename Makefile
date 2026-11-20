@@ -24,7 +24,6 @@ build-apps:
 	$(CARGO) build $(BUILD_ARGS) -p user_lib --bins
 
 # Application images
-PYTHON ?= python3
 # Cargo uses the file stem as the binary name for apps in user/src/bin.
 APPS ?= $(sort $(basename $(notdir $(wildcard user/src/bin/*.rs))))
 OUTPUT_DIR ?= output
@@ -32,7 +31,9 @@ QSPI_IMAGE ?= $(OUTPUT_DIR)/apps.img
 
 .PHONY: pack-apps
 pack-apps: build-apps
-	$(PYTHON) tools/pack-apps -o "$(QSPI_IMAGE)" -- $(foreach app,$(APPS),"$(ARTIFACT_DIR)/$(app)")
+	$(CARGO) run --locked --manifest-path tools/pack/Cargo.toml --target host-tuple \
+		--target-dir "$(CARGO_TARGET_DIR)" -- -o "$(QSPI_IMAGE)" -- \
+		$(foreach app,$(APPS),"$(ARTIFACT_DIR)/$(app)")
 
 # Internal flash via STM32CubeProgrammer
 PROGRAMMER ?= stm32_programmer_cli

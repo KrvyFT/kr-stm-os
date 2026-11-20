@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod batch;
 mod board;
 mod console;
 mod panic_handler;

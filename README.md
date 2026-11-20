@@ -24,7 +24,7 @@ rustup target add thumbv7em-none-eabihf
 make                      # 构建调试版内核
 make PROFILE=release      # 构建发布版内核
 make build-apps           # 构建 user crate 的应用 ELF
-make pack-apps            # 构建应用并打包为 output/apps.img（需要 Python 3.9+）
+make pack-apps            # 构建应用并用 Rust 打包器生成 output/apps.img
 ```
 
 使用 STM32CubeProgrammer 烧录时，将 ST-LINK 的 SWD 和 NRST 接到板上。`make flash-kernel` 重新构建内核，并按 ELF 中的地址写入片内 Flash 后校验。默认连接参数是 Under Reset、硬件复位和 100 kHz。可用 `SWD_ARGS='port=SWD mode=UR reset=HWrst freq=950'` 覆盖。CLI 名称不同时，可以传入 `PROGRAMMER=STM32_Programmer_CLI`。

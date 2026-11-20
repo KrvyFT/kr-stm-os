@@ -1,4 +1,5 @@
 [workspace]
 members = ["kernel", "user"]
+exclude = ["tools/pack"]
 default-members = ["kernel"]
 resolver = "3"

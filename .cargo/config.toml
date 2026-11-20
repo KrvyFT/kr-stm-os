@@ -1,5 +1,9 @@
 [build]
 target = "thumbv7em-none-eabihf"
 
+[alias]
+# Build the std-based pack tool for the machine running Cargo.
+pack = ["run", "--manifest-path", "tools/pack/Cargo.toml", "--target", "host-tuple", "--target-dir", "target"]
+
 [target.thumbv7em-none-eabihf]
 runner = ["probe-rs", "run", "--chip", "STM32H743VGTx"]

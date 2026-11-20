@@ -79,7 +79,7 @@ llvm-objdump -d target/thumbv7em-none-eabihf/release/00hello
 
 ELF 带有入口、段表、符号和调试信息，可用于检查和调试。当前 `hello` 的入口值是 `0x2406_0001`。最低位标记 Thumb，指令实际位于 `0x2406_0000`。应用链接脚本为代码与数据定义不同的 `PT_LOAD`。对每个段，`p_filesz` 是 ELF 里已有的初始化字节数，`p_memsz` 是运行时要占用的内存长度。两者的差额需要在装载时清零。直接把 ELF 文件从开头复制进 SRAM 会把文件头也写到应用入口，CPU 就无法按预期取指。见 [应用链接脚本](../user/link.x) 和 [Arm ELF 规范](https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst)。
 
-运行 `make pack-apps` 构建应用并生成 `output/apps.img`。默认按 `user/src/bin/*.rs` 的文件名升序打包，目前是 `00hello`、`01store_fault`。用 `PROFILE=release` 选择发布版，或者用 `APPS` 显式指定应用列表和顺序。也可以直接运行 `python3 tools/pack-apps -o output/apps.img <应用ELF路径>` 打包已有 ELF。
+运行 `make pack-apps` 构建应用并生成 `output/apps.img`。默认按 `user/src/bin/*.rs` 的文件名升序打包，目前是 `00hello`、`01store_fault`。用 `PROFILE=release` 选择发布版，或者用 `APPS` 显式指定应用列表和顺序。也可以直接运行 `cargo pack -- -o output/apps.img -- <应用ELF路径>` 打包已有 ELF。
 
 打包器按指定顺序读取应用 ELF，检查为小端 ARM 32 位可执行文件，提取入口和 `PT_LOAD`。Makefile 从当前源码推导应用列表，避免把残留构建产物误打包。应用仍在同一个固定 RAM 区轮流运行，应用目录存放在 NOR，更新镜像时无需重编内核。本机的 `/home/krvy/Projects/krunix/os/build.rs` 则通过 `.incbin` 把应用并入内核。
 
@@ -248,7 +248,7 @@ IRQ 事件摘要 ───┘
 | 阶段 | 建议位置与工作 | 完成时应观察到什么 |
 | --- | --- | --- |
 | 1. QSPI 连通 | `kernel/src/board.rs` 接 GPIO、时钟与 QUADSPI，`kernel/src/qspi.rs` 实现 JEDEC ID 与 `read_at` | 稳定读到符合实物版本的 JEDEC ID。逻辑分析仪能区分 CS、CLK、命令和读出字节 |
-| 2. 独立镜像 | 主机 `tools/pack-apps` 生成镜像，内核解析只读目录，先用匹配 loader 烧入独立样本 | 烧录工具校验通过。断电重启后内核按顺序列出 `hello`、第二个应用与段信息。空白或损坏镜像有明确诊断 |
+| 2. 独立镜像 | 主机用 `make pack-apps` 生成镜像，内核解析只读目录，先用匹配 loader 烧入独立样本 | 烧录工具校验通过。断电重启后内核按顺序列出 `hello`、第二个应用与段信息。空白或损坏镜像有明确诊断 |
 | 3. 复制到 SRAM | 在 `kernel/src/batch/` 先实现镜像解析和装载，保持顶层入口只负责编排 | 在调试器里对比目标内存、入口机器码和段内容。长度溢出、越过应用区、无效 Thumb 入口和错误 CRC 都被拒绝 |
 | 4. 进入和退出 | `kernel/src/trap/` 放 ARM 异常入口、帧定义和 SVC 分派，应用入口接退出调用 | 先让整数版 `hello` 返回 0，再跑两个不同返回码。验证 PSP/MSP、特权级以及最后一个应用完成后返回内核 |
 | 5. 应用打印 | `kernel/src/console.rs` 统一提交接口，先在应用退出后排队冲洗 | 内核日志和应用日志按提交顺序出现。坏指针、超过 128 B 和队列满均有确定返回，无半条入队 |
