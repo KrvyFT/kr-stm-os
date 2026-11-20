@@ -1,37 +1,45 @@
 .DEFAULT_GOAL := build
 
+# Hardware targets share the same ST-LINK connection.
+.NOTPARALLEL:
+
+# Firmware and application builds
 CARGO ?= cargo
 CARGO_TARGET_DIR ?= target
 CARGO_FLAGS ?=
 PROFILE ?= debug
+
 TARGET := thumbv7em-none-eabihf
-KERNEL_ELF := $(CARGO_TARGET_DIR)/$(TARGET)/$(PROFILE)/kr-stm-os
+CARGO_PROFILE = $(if $(filter debug,$(PROFILE)),dev,$(PROFILE))
+ARTIFACT_DIR := $(CARGO_TARGET_DIR)/$(TARGET)/$(PROFILE)
+KERNEL_ELF := $(ARTIFACT_DIR)/kr-stm-os
 BUILD_ARGS = --locked --target $(TARGET) --target-dir "$(CARGO_TARGET_DIR)" \
-	--profile $(if $(filter debug,$(PROFILE)),dev,$(PROFILE)) $(CARGO_FLAGS)
+	--profile $(CARGO_PROFILE) $(CARGO_FLAGS)
 
-PROGRAMMER ?= stm32_programmer_cli
-SWD_ARGS ?= port=SWD mode=UR reset=HWrst freq=100
-SWD = "$(PROGRAMMER)" -c $(SWD_ARGS)
-
-DEFAULT_LOADER := tools/flash/STM32H743VI_W25Q64.stldr
-LOADER_URL := https://raw.githubusercontent.com/manoloaterol/MCUDEV_DevEBox_H743-W25Q64-EL/master/STM32H743VI_W25Q64.stldr
-LOADER_SHA256 := 06710874eab2ad7605825194e061ab597e69004d1d032c51e8cdd462693d7c77
-QSPI_LOADER ?= $(DEFAULT_LOADER)
-QSPI_ADDR ?= 0x90000000
-QSPI_SIZE ?= 4096
-QSPI_OUTPUT ?= output/qspi-read.bin
-QSPI_IMAGE ?= apps.img
-
-.PHONY: build build-apps flash-kernel qspi-loader qspi-read qspi-write
-# Hardware targets share the same ST-LINK connection.
-.NOTPARALLEL:
-
+.PHONY: build build-apps
 build:
 	$(CARGO) build $(BUILD_ARGS) -p kr-stm-os
 
 build-apps:
-	$(CARGO) build $(BUILD_ARGS) -p user --bins
+	$(CARGO) build $(BUILD_ARGS) -p user_lib --bins
 
+# Application images
+PYTHON ?= python3
+# Cargo uses the file stem as the binary name for apps in user/src/bin.
+APPS ?= $(sort $(basename $(notdir $(wildcard user/src/bin/*.rs))))
+OUTPUT_DIR ?= output
+QSPI_IMAGE ?= $(OUTPUT_DIR)/apps.img
+
+.PHONY: pack-apps
+pack-apps: build-apps
+	$(PYTHON) tools/pack-apps -o "$(QSPI_IMAGE)" -- $(foreach app,$(APPS),"$(ARTIFACT_DIR)/$(app)")
+
+# Internal flash via STM32CubeProgrammer
+PROGRAMMER ?= stm32_programmer_cli
+SWD_ARGS ?= port=SWD mode=UR reset=HWrst freq=100
+SWD = "$(PROGRAMMER)" -c $(SWD_ARGS)
+
+.PHONY: flash-kernel
 # CubeProgrammer recognizes the file format from its extension.
 flash-kernel: build
 	@set -eu; \
@@ -40,6 +48,17 @@ flash-kernel: build
 	cp -- "$(KERNEL_ELF)" "$$tmp/kernel.elf"; \
 	$(SWD) -w "$$tmp/kernel.elf" -v
 
+# External QSPI flash via STM32CubeProgrammer
+DEFAULT_LOADER := tools/flash/STM32H743VI_W25Q64.stldr
+LOADER_URL := https://raw.githubusercontent.com/manoloaterol/MCUDEV_DevEBox_H743-W25Q64-EL/master/STM32H743VI_W25Q64.stldr
+LOADER_SHA256 := 06710874eab2ad7605825194e061ab597e69004d1d032c51e8cdd462693d7c77
+
+QSPI_LOADER ?= $(DEFAULT_LOADER)
+QSPI_ADDR ?= 0x90000000
+QSPI_SIZE ?= 4096
+QSPI_OUTPUT ?= $(OUTPUT_DIR)/qspi-read.bin
+
+.PHONY: qspi-loader qspi-read qspi-write
 qspi-loader:
 	@set -eu; \
 	loader="$(DEFAULT_LOADER)"; \
@@ -77,4 +96,6 @@ qspi-write:
 	tmp=$$(mktemp -d); \
 	trap 'rm -rf -- "$$tmp"' EXIT; \
 	cp -- "$(QSPI_IMAGE)" "$$tmp/image.bin"; \
-	$(SWD) -el "$$(realpath -- "$(QSPI_LOADER)")" -w "$$tmp/image.bin" "$(QSPI_ADDR)" -v
+	loader=$$(realpath -- "$(QSPI_LOADER)"); \
+	$(SWD) -hardRst; \
+	$(SWD) -el "$$loader" -w "$$tmp/image.bin" "$(QSPI_ADDR)" -v

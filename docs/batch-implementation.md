@@ -2,7 +2,7 @@
 
 目标是在 STM32H743VGT6 上从片内 Flash 启动内核，从板载 W25Q64JV 读取应用镜像，把每个应用装入 AXI SRAM，逐个在非特权态运行。第一版验收时，串口应显示两个应用按顺序运行并退出，最后显示批处理完成。
 
-当前代码已经有独立的用户 crate、`hello` ELF、应用链接脚本和 Thumb 入口。内核仍然执行启动演示和 `panic!("Done!")`。本文中的 QSPI 驱动、打包器、应用加载器、系统调用和 MPU 配置是**接下来要实现的内容**。板级接线来自你提供的 W25Q64JV 原理图片段，本文没有做实板读写或烧录验证。相关代码见 [内核入口](../src/main.rs)、[板级初始化](../src/board.rs)、[应用链接脚本](../user/link.x) 和 [应用入口](../user/src/entry.s)。
+当前内核启动时读取 W25Q64JV 的 JEDEC ID，打印后执行 `panic!("Done!")` 演示。用户 crate 提供 `hello`、应用链接脚本和 Thumb 入口，主机打包器生成 `output/apps.img`。内核侧的应用装载、SVC 分派和 MPU 配置是接下来要实现的内容。板级接线来自你提供的 W25Q64JV 原理图片段，本文没有做实板读写或烧录验证。相关代码见 [内核入口](../kernel/src/main.rs)、[板级初始化](../kernel/src/board.rs)、[应用链接脚本](../user/link.x) 和 [应用入口](../user/src/runtime.rs)。
 
 ## 1. 先分清三种地址
 
@@ -14,11 +14,11 @@
 | W25Q64JV 芯片偏移 | `0x000000`–`0x7FFFFF` | 8 MiB 掉电保留空间。本方案先把 `apps.img` 放在偏移 0 |
 | QUADSPI 映射窗口的已装芯片范围 | `0x9000_0000`–`0x907F_FFFF` | 启用 memory-mapped 读后，CPU 可以用窗口基址加 NOR 偏移读取。烧录工具也可用这个基址为外部存储定址 |
 
-例如，镜像里的文件字节位于 NOR 偏移 `0x1000`。间接读传 `0x001000` 给控制器。映射读时访问 `0x9000_1000`。应用真正的运行地址由 ELF 决定，可能是 `0x2406_0000`。这三个数字分别回答“芯片里放哪”“CPU 用哪个窗口读”“程序从哪执行”。链接脚本和烧录地址各自解决其中一个问题。见 [内核内存布局](../memory.x)、[应用内存布局](../user/link.x) 和 [STM32H743 RM0433，Memory map 与 QUADSPI](https://www.st.com/resource/en/reference_manual/rm0433-stm32h7-series-and-stm32h7rs-lines-armbased-32bit-mcus-stmicroelectronics.pdf)。
+例如，镜像里的文件字节位于 NOR 偏移 `0x1000`。间接读传 `0x001000` 给控制器。映射读时访问 `0x9000_1000`。应用真正的运行地址由 ELF 决定，可能是 `0x2406_0000`。这三个数字分别回答“芯片里放哪”“CPU 用哪个窗口读”“程序从哪执行”。链接脚本和烧录地址各自解决其中一个问题。见 [内核内存布局](../kernel/memory.x)、[应用内存布局](../user/link.x) 和 [STM32H743 RM0433，Memory map 与 QUADSPI](https://www.st.com/resource/en/reference_manual/rm0433-stm32h7-series-and-stm32h7rs-lines-armbased-32bit-mcus-stmicroelectronics.pdf)。
 
 ```text
 主机编译内核 ELF ── SWD / probe-rs ──→ 片内 Flash ── 复位启动内核
-主机编译应用 ELF ── 打包 apps.img ── SWD / external loader ──→ W25Q64JV
+主机编译应用 ELF ── 打包 output/apps.img ── SWD / external loader ──→ W25Q64JV
                                                             │
 内核运行批处理循环 ←── SVC exit ←── 应用在 SRAM 运行 ←── 内核读取并装载
 ```
@@ -42,7 +42,7 @@
 
 - **板载 QSPI** 已由 PCB 连接。调试时按网名找测试点或可访问焊盘，有逻辑分析仪时先看 PB6、PB2、PD11、PD12。原理图片段没有给出这些信号的排针编号。
 - **SWD 烧录和调试** 用探针接 MCU 的 SWDIO（PA13）、SWCLK（PA14）和 GND。目标电压参考 VTref、复位 NRST 按探针与板端标识核对。VTref 通常用于电平参考，是否由探针供电要看探针标注。具体插头方向和脚号需要板级接插件图。
-- **串口日志** 用 3.3 V TTL USB 转串口。PA9（MCU TX）接转接器 RX，GND 相连。需要接收时再把转接器 TX 接 PA10（MCU RX），当前内核只保留发送句柄。终端选 19200、8N1、无流控。见 [当前板级初始化](../src/board.rs)。
+- **串口日志** 用 3.3 V TTL USB 转串口。PA9（MCU TX）接转接器 RX，GND 相连。需要接收时再把转接器 TX 接 PA10（MCU RX），当前内核只保留发送句柄。终端选 19200、8N1、无流控。见 [当前板级初始化](../kernel/src/board.rs)。
 
 ### 2.2 NOR 为什么要先擦、再写
 
@@ -59,7 +59,7 @@ W25Q64JV 的 64 Mbit 对应 8 MiB。**页**是编程边界，大小 256 B。**�
 
 ### 2.3 在当前项目怎么接入
 
-1. 在 `src/qspi.rs` 封装 Flash。由 `Board::init()` 在现有 PWR/RCC 初始化之后，配置 GPIOB、GPIOD、GPIOE 的复用和 QUADSPI 时钟及复位，把 Flash 句柄交给 `Board`。PB6 片选也要配置成 AF10。HAL 示例单独设置片选 GPIO，照抄 `bank1()` 的时钟和 IO 参数容易漏掉它。
+1. 在 `kernel/src/qspi.rs` 封装 Flash。由 `Board::init()` 在现有 PWR/RCC 初始化之后，配置 GPIOB、GPIOD、GPIOE 的复用和 QUADSPI 时钟及复位，把 Flash 句柄交给 `Board`。PB6 片选也要配置成 AF10。HAL 示例单独设置片选 GPIO，照抄 `bank1()` 的时钟和 IO 参数容易漏掉它。
 2. 配置单芯片、Bank 1、低速、符合 NOR 要求的时钟模式和片选高电平间隔。间接普通读使用 24 位地址。控制器的设备大小 `FSIZE` 用的是地址位数减一，8 MiB 等于 `2^23` 字节，对应 `FSIZE = 22`。地址阶段仍发送 24 位，容量和传输地址长度各有用途。
 3. 先实现 `jedec_id()`，使其只发指令并读三个字节，不添加地址。接着实现 `read_at(offset, &mut [u8])`，用 `checked_add` 检查读区间，空缓冲区直接返回。底层等待应可超时。带长度上限的 HAL 操作按其支持的大小分块，失败就报告偏移和错误。
 4. 用间接读先跑通整个批处理。后续需要改善吞吐量时，再尝试 Quad fast read 或 memory-mapped。映射模式由控制器把 CPU 读转换为 NOR 事务。通过 `0x9000_0000` 窗口直接写内存无法完成 NOR 页编程。本文应用链接到 SRAM，切到 QSPI 原地执行还要重新安排应用链接地址。
@@ -71,26 +71,28 @@ W25Q64JV 的 64 Mbit 对应 8 MiB。**页**是编程边界，大小 256 B。**�
 ### 3.1 先认识 ELF 和 apps.img
 
 ```bash
-cargo build --locked -p user --bin hello
-cargo build --locked --release -p user --bins
-readelf -h -lW target/thumbv7em-none-eabihf/release/hello
-llvm-objdump -d target/thumbv7em-none-eabihf/release/hello
+cargo build --locked -p user_lib --bin 00hello
+cargo build --locked --release -p user_lib --bins
+readelf -h -lW target/thumbv7em-none-eabihf/release/00hello
+llvm-objdump -d target/thumbv7em-none-eabihf/release/00hello
 ```
 
 ELF 带有入口、段表、符号和调试信息，可用于检查和调试。当前 `hello` 的入口值是 `0x2406_0001`。最低位标记 Thumb，指令实际位于 `0x2406_0000`。应用链接脚本为代码与数据定义不同的 `PT_LOAD`。对每个段，`p_filesz` 是 ELF 里已有的初始化字节数，`p_memsz` 是运行时要占用的内存长度。两者的差额需要在装载时清零。直接把 ELF 文件从开头复制进 SRAM 会把文件头也写到应用入口，CPU 就无法按预期取指。见 [应用链接脚本](../user/link.x) 和 [Arm ELF 规范](https://github.com/ARM-software/abi-aa/blob/main/aaelf32/aaelf32.rst)。
 
-建议单独加主机打包器，例如 `tools/pack-apps`。它按明确列出的顺序读取应用 ELF，检查为小端 ARM 32 位可执行文件，提取入口和 `PT_LOAD`，再生成紧凑的 `apps.img`。显式列出应用可避免把残留构建产物误打包。镜像独立生成，内核也能单独构建和烧录。与 `krunix` 相比，仍然在同一个固定 RAM 区轮流装应用，应用目录改存到 NOR。本机的 `/home/krvy/Projects/krunix/os/build.rs` 通过 `.incbin` 把应用并入内核。STM32 由独立打包器生成镜像，镜像更新不需要重编内核。
+运行 `make pack-apps` 构建应用并生成 `output/apps.img`。默认按 `user/src/bin/*.rs` 的文件名升序打包，目前是 `00hello`、`01store_fault`。用 `PROFILE=release` 选择发布版，或者用 `APPS` 显式指定应用列表和顺序。也可以直接运行 `python3 tools/pack-apps -o output/apps.img <应用ELF路径>` 打包已有 ELF。
 
-建议先冻结一版简单格式。整数统一用小端 `u32` 并逐字段编码，镜像偏移一律从镜像首字节算起。文件从前往后依次是镜像头、应用表、所有段表、段负载。解析时检查这四块的边界和顺序，段的目标地址独立验证。
+打包器按指定顺序读取应用 ELF，检查为小端 ARM 32 位可执行文件，提取入口和 `PT_LOAD`。Makefile 从当前源码推导应用列表，避免把残留构建产物误打包。应用仍在同一个固定 RAM 区轮流运行，应用目录存放在 NOR，更新镜像时无需重编内核。本机的 `/home/krvy/Projects/krunix/os/build.rs` 则通过 `.incbin` 把应用并入内核。
 
-| 内容 | 建议字段 |
+KAPP v1 的整数统一用小端 `u32` 并逐字段编码，镜像偏移一律从镜像首字节算起。文件从前往后依次是镜像头、应用表、所有段表、段负载。解析时检查这四块的边界和顺序，段的目标地址独立验证。
+
+| 内容 | 字段 |
 | --- | --- |
 | 24 B 镜像头 | `magic[4] = "KAPP"`、`version = 1`、`total_len`、`app_count`、`app_table_offset`、`image_crc32` |
 | 28 B 应用表项 | `name[16]`（短 ASCII 名，零填充）、`entry`（保留 Thumb 位）、`segment_count`、`segment_table_offset` |
 | 20 B 段表项 | `dst_addr`、`payload_offset`、`file_len`、`mem_len`、`flags`（沿用 ELF 的 R/W/X 位） |
 | 负载 | 各段的 `file_len` 字节，`mem_len - file_len` 由内核清零 |
 
-打包端和内核使用同一种 CRC-32/ISO-HDLC，计算 `[0, total_len)` 并将 CRC 字段本身的 4 字节按零处理。CRC 用于发现写入或传输损坏。验收时先把容量上限、应用数上限（例如 16）和段数上限写进两端的格式约定，支持空目录正常完成。裸 NOR 的开头通常读到 `FF FF FF FF`，内核应报告未装镜像，停在诊断路径。
+CRC-32/ISO-HDLC 覆盖 `[0, total_len)`，计算时将 CRC 字段本身的 4 字节按零处理，用于发现写入或传输损坏。打包器限制镜像为 8 MiB、最多 16 个应用、每个应用最多 16 个装载段，也支持零应用镜像。应用名取自 ELF 文件名（去掉可选的 `.elf` 后缀），长度为 1–16 字节，可使用 ASCII 字母、数字、下划线、点和连字符。裸 NOR 的开头通常读到 `FF FF FF FF`，内核应报告未装镜像，停在诊断路径。
 
 ### 3.2 烧录时谁负责写 QSPI
 
@@ -103,11 +105,11 @@ ELF 带有入口、段表、符号和调试信息，可用于检查和调试。�
 
 先从板卡供应商找与这六根引脚和 W25Q64JV 同时匹配的 `.stldr`。如果没有，经验证后可用 ST 的 external loader 工程模板改造，设置 `0x9000_0000`、8 MiB、256 B 页和 4 KiB 扇区，按本板初始化 Bank 1。STM32H743I-EVAL 的官方样例适合作为移植参考，它的外部 Flash 型号与本板不同。也可以为 probe-rs 编写匹配的 Flash algorithm 和 target 描述。当前本机 `probe-rs chip info STM32H743VGTx` 即使列出外部 NVM 地址范围，也只凭这个输出无法确认算法、板级引脚和器件一致。见 [ST external loader 工程](https://github.com/STMicroelectronics/stm32-memory-loaders) 和 [probe-rs Flash algorithm 说明](https://probe.rs/docs/knowledge-base/cmsis-packs/)。
 
-匹配的 loader 和 `apps.img` 准备好后，在仓库根目录用 Makefile 调用 CubeProgrammer。默认 loader 可用 `make qspi-loader` 获取。使用其他 loader 时，传入实际路径。连接需要 ST-LINK 和已接好的 NRST。
+匹配的 loader 和 `output/apps.img` 准备好后，在仓库根目录用 Makefile 调用 CubeProgrammer。默认 loader 可用 `make qspi-loader` 获取。使用其他 loader 时，传入实际路径。连接需要 ST-LINK 和已接好的 NRST。
 
 ```bash
 make qspi-read QSPI_LOADER=/path/to/board-w25q64jv.stldr
-make qspi-write QSPI_LOADER=/path/to/board-w25q64jv.stldr QSPI_IMAGE=apps.img
+make qspi-write QSPI_LOADER=/path/to/board-w25q64jv.stldr
 ```
 
 默认写入地址 `0x90000000` 是 loader 对外公布的基址，对应 NOR 内部偏移 0。先确认镜像涉及的完整扇区都可擦除。首次使用 loader 时，用 `QSPI_ADDR` 指向已确认空闲的扇区，写短样本并在断电重启后核对回读。若没有合适的 loader，可写单独的板上测试固件，经 SWD 把样本放进 SRAM，调用 NOR 擦写函数并回读。正式内核第一版保留读取能力就够了。见 [Makefile 用法](../README.md#构建与烧录)和 [STM32CubeProgrammer CLI 的 `-w`、`-v` 和 `-el`](https://dev.st.com/stm32cube-docs/prog/2.23.0/en/docs/markup/CubeProg_Command_Lines.html)。
@@ -163,21 +165,21 @@ SVC 是程序主动执行的指令，行为类似 `krunix` 的 `ecall`。IRQ 由
 
 - 填 `PC = ELF entry & !1`。ELF 的低位标记 Thumb，异常帧里用对齐后的指令地址。
 - 填 `xPSR = 1 << 24`，显式启用 Thumb 状态。初始帧按 8 字节对齐构造，用不到额外对齐填充。
-- 如果沿用当前 `b.w user_main`，帧中的 LR 必须指向一个应用可执行的 Thumb 返回桩。建议在 `SVC exit` 就绪后，把共用入口改为 `bl user_main`，然后执行退出 SVC。这样应用的 Rust 返回值自然留在 `r0`，所有应用返回都经过同一个入口约定。
+- 应用的 Rust 入口 `_start()` 负责调用 `main()`，再把返回值交给退出系统调用。因此 `main()` 的返回地址由入口里的函数调用设置，初始帧的 LR 不参与这条返回路径。
 - 初始化基本帧里的通用寄存器。为了避免泄露内核寄存器内容，切换时也要给应用的 `r4–r11` 确定初值。版本一只允许已验证的基本帧路径。
 - 写好 PSP 和 `CONTROL.nPRIV = 1`，按要求执行指令同步。Handler 通过 `EXC_RETURN = 0xFFFF_FFFD` 发起基本帧异常返回，CPU 从 PSP 弹出应用帧，进入**非特权 Thread mode + PSP**。这个返回码选择 Thread 和 PSP，`CONTROL.nPRIV` 决定返回后的特权级。
 
-至此应用的第一条指令才开始执行。与 `krunix` 构造 `sepc`、用户 SP 和 `sstatus` 后 `sret` 的目标一致。具体的寄存器、栈和返回指令按 Cortex-M7 的规则设置。见 [应用入口汇编](../user/src/entry.s) 和 [Arm Cortex-M7 手册，Exception return 表](https://documentation-service.arm.com/static/61efd8352dd99944d05142d1)。
+至此应用的第一条指令才开始执行。与 `krunix` 构造 `sepc`、用户 SP 和 `sstatus` 后 `sret` 的目标一致。具体的寄存器、栈和返回指令按 Cortex-M7 的规则设置。见 [Rust 应用入口](../user/src/runtime.rs) 和 [Arm Cortex-M7 手册，Exception return 表](https://documentation-service.arm.com/static/61efd8352dd99944d05142d1)。
 
 #### 第三步：应用请求 write，内核办完后返回应用
 
 建议用 `svc #imm` 区分调用，例如内核启动用 `#0`，用户退出用 `#1`，用户写入用 `#2`。对写入，`r0` 放用户缓冲区指针，`r1` 放字节长度。裸汇编入口用 `EXC_RETURN` 判定硬件帧来自哪条栈，必要时解析扩展帧，Rust 分派函数从基本帧读参数。若按立即数派发，在验证返回 PC 位于对应的可执行范围后，读 `stacked_pc - 2` 处的 Thumb 半字并检查它确实是 SVC 指令。保存的 PC 已经指向 SVC 后面，返回时原值即可。
 
-`write` 先对长度设上限，再用 checked arithmetic 验证整个切片在应用可读范围。空写入可直接返回 0，避免为任意空指针构造切片。把字节复制到内核拥有的队列，然后把写入结果放回异常帧的 `r0`。应用继续运行后可能马上复用原缓冲区，所以串口驱动应持有复制好的数据。用能够从 PSP 恢复该帧的实际 `EXC_RETURN` 返回。这个过程不需要另存一份应用的完整上下文。见 [当前串口队列](../src/console.rs) 和 [Arm Cortex-M7 手册，SVCall 与异常返回](https://documentation-service.arm.com/static/61efd8352dd99944d05142d1)。
+`write` 先对长度设上限，再用 checked arithmetic 验证整个切片在应用可读范围。空写入可直接返回 0，避免为任意空指针构造切片。把字节复制到内核拥有的队列，然后把写入结果放回异常帧的 `r0`。应用继续运行后可能马上复用原缓冲区，所以串口驱动应持有复制好的数据。用能够从 PSP 恢复该帧的实际 `EXC_RETURN` 返回。这个过程不需要另存一份应用的完整上下文。见 [当前串口队列](../kernel/src/console.rs) 和 [Arm Cortex-M7 手册，SVCall 与异常返回](https://documentation-service.arm.com/static/61efd8352dd99944d05142d1)。
 
 #### 第四步：应用退出，批处理循环拿回控制权
 
-`hello` 的 `user_main()` 先返回整数 `0`，共用入口再触发 `SVC exit`。handler 取退出码，标记应用执行结束，把结果写到**内核**启动 SVC 的保存帧或经明确约定的内核状态。恢复内核保存的 `r4–r11` 和 MSP 现场，令 Thread mode 回到特权级，再走保存的内核 `EXC_RETURN`。若内核现场是基本帧，其返回码通常为 `0xFFFF_FFF9`。应用现场在此结束，无需为退出的应用补存 `r4–r11`。恢复结果是内核在启动 SVC 后面继续，批处理循环可以冲洗串口、打印退出码和加载下一应用。
+`hello` 的 `main()` 先返回整数 `0`，共用入口再触发 `SVC exit`。handler 取退出码，标记应用执行结束，把结果写到**内核**启动 SVC 的保存帧或经明确约定的内核状态。恢复内核保存的 `r4–r11` 和 MSP 现场，令 Thread mode 回到特权级，再走保存的内核 `EXC_RETURN`。若内核现场是基本帧，其返回码通常为 `0xFFFF_FFF9`。应用现场在此结束，无需为退出的应用补存 `r4–r11`。恢复结果是内核在启动 SVC 后面继续，批处理循环可以冲洗串口、打印退出码和加载下一应用。
 
 注意工程实现里的两条边界。第一，普通 SVC 返回原代码时继续用本次进门的 `EXC_RETURN`，退出应用才恢复之前保存的内核令牌。第二，MSP 上当前 exit handler 的调用帧必须通过受控汇编路径正确收尾，才把 MSP 恢复到内核硬件帧。直接在普通 Rust 函数的深层调用里改 SP 会破坏其栈帧。
 
@@ -209,7 +211,7 @@ SVC 是程序主动执行的指令，行为类似 `krunix` 的 `ecall`。IRQ 由
 
 ### 6.1 现有代码已经提供的语义
 
-当前 `Board` 持有 `ConsoleDriver`。它独占 USART1 TX，另留 DMA1 Stream 0 给内核 panic。普通调用通过 `try_print(&str)` 把一条消息完整复制到 1024 B 队列。最多 128 B，剩余空间不足就返回 `Full`，队列不变。入队在短临界区里完成，所以**一次调用内的字节不会被另一个生产者插进去**。`poll()` 从队列取一个字节，USART 暂时忙时用 `pending` 保留它。只有主程序调用 `poll()` 或 `wait_for_write()`，普通输出才前进。UART 一条 TX 线一次发送一位，所谓同时发送实际是多个代码路径同时提交消息。见 [控制台实现](../src/console.rs) 和 [panic DMA 实现](../src/console/panic_dma.rs)。
+当前 `Board` 持有 `ConsoleDriver`。它独占 USART1 TX，另留 DMA1 Stream 0 给内核 panic。普通调用通过 `try_print(&str)` 把一条消息完整复制到 1024 B 队列。最多 128 B，剩余空间不足就返回 `Full`，队列不变。入队在短临界区里完成，所以**一次调用内的字节不会被另一个生产者插进去**。`poll()` 从队列取一个字节，USART 暂时忙时用 `pending` 保留它。只有主程序调用 `poll()` 或 `wait_for_write()`，普通输出才前进。UART 一条 TX 线一次发送一位，所谓同时发送实际是多个代码路径同时提交消息。见 [控制台实现](../kernel/src/console.rs) 和 [panic DMA 实现](../kernel/src/console/panic_dma.rs)。
 
 在 19200、8N1 下，一个数据字节通常占 10 个线路位。128 B 连续发完约 67 ms，1024 B 约 0.53 s。把一整条发送放进高优先级 handler 轮询，会让低优先级工作等很久。临界区只保护队列和发送状态的短操作，等待 UART 就绪应在临界区外。
 
@@ -233,23 +235,23 @@ IRQ 事件摘要 ───┘
 | **持续输出：TX IRQ 消费队列** | TX 就绪触发 USART1 ISR。ISR 在硬件可收时写入字节，队列空时关 TX 就绪中断。生产者重新入队后启动发送 | 适合要边运行边看日志的应用，不需要把驱动从主函数临时借给 SVC。需要用短临界区把“入队并启动”与“判空并关闭”协调起来 |
 | **后续扩展：DMA 分块** | DMA 从内核的发送缓冲区往 TDR 写字节，完成 IRQ 安排下一块 | 吞吐量更高。要管理 DMA 可访问的缓冲区、缓存一致性、块生命周期以及 panic 接管协议。在目前的 19200 波特率下优先把队列和 IRQ 做正确 |
 
-**推荐先用轮询验证退出，再切 TX IRQ。** 切换时只保留一个普通 TX 消费者。主程序和 SVC 入队，ISR 消费，UART TX 句柄由控制台驱动持有。不要在主程序持有队列借用或驱动可变借用时进入可能访问同一对象的 SVC，否则容易触发 `RefCell` 借用错误或违反独占访问。用 IRQ 版本时，等待冲洗应等待“队列空、无暂存字节、USART TC 为 1”，并让消费者中断能执行。TX 就绪表示 TDR 或 FIFO 能收下一个字节，TC 才表示最后一帧已从 TX 引脚发完。见 [STM32 RM0433，USART ISR/CR1](https://www.st.com/resource/en/reference_manual/rm0433-stm32h7-series-and-stm32h7rs-lines-armbased-32bit-mcus-stmicroelectronics.pdf) 和 [当前 wait_for_write](../src/console.rs)。
+**推荐先用轮询验证退出，再切 TX IRQ。** 切换时只保留一个普通 TX 消费者。主程序和 SVC 入队，ISR 消费，UART TX 句柄由控制台驱动持有。不要在主程序持有队列借用或驱动可变借用时进入可能访问同一对象的 SVC，否则容易触发 `RefCell` 借用错误或违反独占访问。用 IRQ 版本时，等待冲洗应等待“队列空、无暂存字节、USART TC 为 1”，并让消费者中断能执行。TX 就绪表示 TDR 或 FIFO 能收下一个字节，TC 才表示最后一帧已从 TX 引脚发完。见 [STM32 RM0433，USART ISR/CR1](https://www.st.com/resource/en/reference_manual/rm0433-stm32h7-series-and-stm32h7rs-lines-armbased-32bit-mcus-stmicroelectronics.pdf) 和 [当前 wait_for_write](../kernel/src/console.rs)。
 
 最容易漏掉的是**丢唤醒**。假设 ISR 看到队列空，线程随后入队并开中断，然后 ISR 又关了它，新数据就会一直停在队列。把队列状态和 TX 中断启停纳入同一同步协议。让生产者在提交成功后启用发送，让消费者在同一个临界区内确认队列仍空后关闭发送中断。应实际测试“队列从空变非空”和“最后一个字节送出时恰好新提交”两种情况。
 
 ### 6.4 应用 panic 和内核 panic 的边界
 
-应用 panic 在用户态结束该应用，例如后续通过 `SVC exit` 报失败，再由内核决定继续。现有 `hello` 的 panic handler 暂时自旋。`panic_dma` 留给内核无法继续执行的情形。它目前禁用可屏蔽中断，使用独立缓冲区和保留的 DMA Stream 直接写 USART1，避免依赖普通队列的借用或锁。引脚上正在发送的旧字节可能先出现，未排出的普通日志可能丢失。如果将来普通发送也用 DMA，panic 接管前需要停掉普通 TX IRQ / DMA 请求，并在有界等待内处理正在发送的字节；同一 TDR 只能有一个活跃的发送方。见 [DMA Panic 与 USART 完成条件](dma-panic.md)。
+应用发生 panic 时，用户态 handler 尝试输出一条日志，再用 `SVC exit` 提交退出码 `1`。内核接入退出处理后，可以记录该状态并继续批处理。如果退出调用意外返回，用户程序进入自旋，避免再次触发 panic。`panic_dma` 留给内核无法继续执行的情形。它目前禁用可屏蔽中断，使用独立缓冲区和保留的 DMA Stream 直接写 USART1，避免依赖普通队列的借用或锁。引脚上正在发送的旧字节可能先出现，未排出的普通日志可能丢失。如果将来普通发送也用 DMA，panic 接管前需要停掉普通 TX IRQ / DMA 请求，并在有界等待内处理正在发送的字节；同一 TDR 只能有一个活跃的发送方。见 [DMA Panic 与 USART 完成条件](dma-panic.md)。
 
 ## 7. 按阶段实现和验收
 
 | 阶段 | 建议位置与工作 | 完成时应观察到什么 |
 | --- | --- | --- |
-| 1. QSPI 连通 | `src/board.rs` 接 GPIO、时钟与 QUADSPI，`src/qspi.rs` 实现 JEDEC ID 与 `read_at` | 稳定读到符合实物版本的 JEDEC ID。逻辑分析仪能区分 CS、CLK、命令和读出字节 |
+| 1. QSPI 连通 | `kernel/src/board.rs` 接 GPIO、时钟与 QUADSPI，`kernel/src/qspi.rs` 实现 JEDEC ID 与 `read_at` | 稳定读到符合实物版本的 JEDEC ID。逻辑分析仪能区分 CS、CLK、命令和读出字节 |
 | 2. 独立镜像 | 主机 `tools/pack-apps` 生成镜像，内核解析只读目录，先用匹配 loader 烧入独立样本 | 烧录工具校验通过。断电重启后内核按顺序列出 `hello`、第二个应用与段信息。空白或损坏镜像有明确诊断 |
-| 3. 复制到 SRAM | 在 `src/batch/` 先实现镜像解析和装载，保持顶层入口只负责编排 | 在调试器里对比目标内存、入口机器码和段内容。长度溢出、越过应用区、无效 Thumb 入口和错误 CRC 都被拒绝 |
-| 4. 进入和退出 | `src/trap/` 放 ARM 异常入口、帧定义和 SVC 分派，应用入口接退出调用 | 先让整数版 `hello` 返回 0，再跑两个不同返回码。验证 PSP/MSP、特权级以及最后一个应用完成后返回内核 |
-| 5. 应用打印 | `src/console.rs` 统一提交接口，先在应用退出后排队冲洗 | 内核日志和应用日志按提交顺序出现。坏指针、超过 128 B 和队列满均有确定返回，无半条入队 |
+| 3. 复制到 SRAM | 在 `kernel/src/batch/` 先实现镜像解析和装载，保持顶层入口只负责编排 | 在调试器里对比目标内存、入口机器码和段内容。长度溢出、越过应用区、无效 Thumb 入口和错误 CRC 都被拒绝 |
+| 4. 进入和退出 | `kernel/src/trap/` 放 ARM 异常入口、帧定义和 SVC 分派，应用入口接退出调用 | 先让整数版 `hello` 返回 0，再跑两个不同返回码。验证 PSP/MSP、特权级以及最后一个应用完成后返回内核 |
+| 5. 应用打印 | `kernel/src/console.rs` 统一提交接口，先在应用退出后排队冲洗 | 内核日志和应用日志按提交顺序出现。坏指针、超过 128 B 和队列满均有确定返回，无半条入队 |
 | 6. 权限与持续输出 | 接 MPU、应用 Fault 处理、USART1 TX IRQ。超时和抢占可另外验证 | 测试应用尝试访问被禁止的地址时记录原因并继续下一个应用。运行中的应用能持续输出，压力测试无交错、无丢唤醒 |
 
 每次只新增一个可观测现象。先证明 QSPI 能读，再证明 RAM 写对，最后才看应用能否执行。这三个检查点分属外设、加载器和 CPU 异常机制，能大幅缩小排查范围。

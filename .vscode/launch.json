@@ -16,7 +16,7 @@
         {
           "coreIndex": 0,
           "programBinary": "${workspaceFolder}/target/thumbv7em-none-eabihf/debug/kr-stm-os",
-          "svdFile": "${workspaceFolder}/svd/STM32H743.svd"
+          "svdFile": "${workspaceFolder}/tools/svd/STM32H743.svd"
         }
       ]
     }

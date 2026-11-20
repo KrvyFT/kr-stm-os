@@ -4,22 +4,23 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| [`src/main.rs`](../src/main.rs) | 定义 `#[entry]`，串联板级初始化、启动输出、PC13 电平切换和 panic 演示 |
-| [`src/board.rs`](../src/board.rs) | 取得 STM32 外设所有权，配置供电和时钟，初始化 GPIO、USART1 和 DMA1 |
-| [`src/console.rs`](../src/console.rs) | 管理普通输出队列，通过 HAL 轮询发送，保存 DMA1 Stream 0 的所有权 |
-| [`src/console/panic_dma.rs`](../src/console/panic_dma.rs) | 在 panic 路径中格式化消息、维护 D-Cache 并直接操作 USART1 和 DMA 寄存器 |
-| [`src/panic_handler.rs`](../src/panic_handler.rs) | 从 `PanicInfo` 提取消息与源码位置，调用 panic 输出后自旋 |
-| [`memory.x`](../memory.x)、[`build.rs`](../build.rs) 和 [`.cargo/config.toml`](../.cargo/config.toml) | 定义内核的内存区域和链接参数，以及项目的交叉编译目标和烧录 runner |
+| [`kernel/src/main.rs`](../kernel/src/main.rs) | 定义 `#[entry]`，串联板级初始化、启动输出、PC13 电平切换、读取 JEDEC ID 和 panic 演示 |
+| [`kernel/src/board.rs`](../kernel/src/board.rs) | 取得 STM32 外设所有权，配置供电和时钟，初始化 GPIO、USART1、DMA1 和 QUADSPI |
+| [`kernel/src/qspi.rs`](../kernel/src/qspi.rs) | 封装 W25Q64JV 的 JEDEC ID 和按偏移读取操作 |
+| [`kernel/src/console.rs`](../kernel/src/console.rs) | 管理普通输出队列，通过 HAL 轮询发送，保存 DMA1 Stream 0 的所有权 |
+| [`kernel/src/console/panic_dma.rs`](../kernel/src/console/panic_dma.rs) | 在 panic 路径中格式化消息、维护 D-Cache 并直接操作 USART1 和 DMA 寄存器 |
+| [`kernel/src/panic_handler.rs`](../kernel/src/panic_handler.rs) | 从 `PanicInfo` 提取消息与源码位置，调用 panic 输出后自旋 |
+| [`memory.x`](../kernel/memory.x)、[`build.rs`](../kernel/build.rs) 和 [`.cargo/config.toml`](../.cargo/config.toml) | 定义内核的内存区域和链接参数，以及项目的交叉编译目标和烧录 runner |
 
 `main.rs` 使用 `#![no_std]` 和 `#![no_main]`。复位后，`cortex-m-rt` 提供的启动代码准备 RAM 中的静态数据，包括初始化 `.data` 和清零 `.bss`，随后调用 `#[entry]` 指定的 `main()`。
 
 `Board::init()` 使用 `pac::Peripherals::take()` 取得外设实例。它先配置 PWR 和 RCC，再初始化 PA9、PA10 和 PC13。PA9 和 PA10 使用 AF7，由 USART1 分别作为 TX 和 RX。PC13 配置为推挽输出。USART1 初始化后只保留发送句柄。DMA1 开启时钟后，Stream 0 随 `ConsoleDriver` 一起交给入口函数，控制台此时才允许 panic DMA 接管发送。
 
-入口函数把启动消息放入队列，把 PC13 拉低，调用 `wait_for_write()` 等待串口发完，再把 PC13 拉高并调用 `panic!("Done!")`。这个顺序让同一串口上的启动消息先于 panic 消息完整发送。
+入口函数把启动消息放入队列，把 PC13 拉低，调用 `wait_for_write()` 等待串口发完，再把 PC13 拉高。接着读取并打印 Flash 的 JEDEC ID，再次等串口发完后调用 `panic!("Done!")`。两次等待确保进入 panic DMA 路径前，普通串口消息已完整发送。
 
 ## 链接与内存
 
-Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指令集和硬浮点 ABI。内核的 `build.rs` 只给 `kr-stm-os` 二进制传入 `-Tlink.x`，因此 workspace 中的 `user` 可以定义自己的链接布局。内核使用 `cortex-m-rt` 的链接脚本，从 `memory.x` 读取以下区域：
+Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指令集和硬浮点 ABI。内核的 `build.rs` 只给 `kr-stm-os` 二进制传入 `-Tlink.x`，因此 workspace 中的 `user` 可以定义自己的链接布局。内核的构建脚本把 `kernel/` 加入链接器搜索路径，让 `cortex-m-rt` 的 `link.x` 找到定义以下区域的 `kernel/memory.x`。
 
 | 区域 | 起始地址 | 项目使用范围 | 用途 |
 | --- | --- | --- | --- |
@@ -29,7 +30,9 @@ Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指
 
 panic 缓冲区位于 AXI SRAM 的 `.bss`。如果将来调整链接布局，需要继续把它放在 DMA1 可访问的内存，并保留 32 字节对齐。[DMA 缓冲区与缓存维护](dma-panic.md#3-准备-dma-能读到的消息)
 
-`cargo build --locked -p user --bin hello` 生成应用 ELF。应用以 [`_start`](../user/src/entry.s) 为入口，尾跳转至 Rust 的 `user_main`，把返回值留在 `r0`。后续加载器负责复制可加载段、清零零填充区域、设置应用栈和安排返回地址。`hello` 目前只返回 `0`，用于验证链接和入口。
+`cargo build --locked -p user_lib --bin 00hello` 生成应用 ELF。应用以 Rust 的 [`_start`](../user/src/runtime.rs) 为入口，调用 `main()`，再把返回值交给 `exit()`。`00hello` 发起一次写入请求后返回 `0`。后续由内核复制可加载段、清零零填充区域，并在进入应用前设置 PSP。
+
+用户库的 [`lib.rs`](../user/src/lib.rs) 提供应用使用的 `write` 和 `exit` 接口。[用户态控制台](../user/src/console.rs) 将格式化结果交给 `write`，[系统调用模块](../user/src/syscall.rs) 集中处理 SVC 编号和传参寄存器。应用编写和输出格式因此可以独立于底层调用约定。
 
 ## 普通串口输出
 

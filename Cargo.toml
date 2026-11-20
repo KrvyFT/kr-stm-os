@@ -1,23 +1,4 @@
 [workspace]
-members = ["user"]
-default-members = ["."]
+members = ["kernel", "user"]
+default-members = ["kernel"]
 resolver = "3"
-
-[package]
-name = "kr-stm-os"
-version = "0.1.0"
-edition = "2024"
-
-[[bin]]
-name = "kr-stm-os"
-path = "src/main.rs"
-# The bare-metal target does not provide Rust's standard test harness.
-test = false
-bench = false
-
-[dependencies]
-cortex-m = "0.7.10"
-cortex-m-rt = "0.7.5"
-heapless = "0.9.3"
-nb = "1.1.0"
-stm32h7xx-hal = { version = "0.16.0", features = ["stm32h743v", "xspi"] }

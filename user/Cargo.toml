@@ -1,5 +1,5 @@
 [package]
-name = "user"
+name = "user_lib"
 version = "0.1.0"
 edition = "2024"
 publish = false
@@ -11,7 +11,16 @@ doctest = false
 bench = false
 
 [[bin]]
-name = "hello"
-path = "src/bin/hello.rs"
+name = "00hello"
+path = "src/bin/00hello.rs"
 test = false
 bench = false
+
+[[bin]]
+name = "01store_fault"
+path = "src/bin/01store_fault.rs"
+test = false
+bench = false
+
+[dependencies]
+heapless = "0.9.3"

@@ -3,7 +3,8 @@ ENTRY(_start)
 MEMORY
 {
     /* Top 128 KiB of D1 AXI SRAM, reserved by the kernel's memory.x. */
-    APP (rwx) : ORIGIN = 0x24060000, LENGTH = 128K
+    APP   (rwx) : ORIGIN = 0x24060000, LENGTH = 124K
+    STACK (rw)  : ORIGIN = 0x2407F000, LENGTH = 4K
 }
 
 PHDRS
@@ -16,7 +17,7 @@ SECTIONS
 {
     .text ORIGIN(APP) :
     {
-        KEEP(*(.text._start))
+        KEEP(*(.text.entry))
         *(.text .text.*)
     } > APP :code
 
@@ -46,9 +47,8 @@ SECTIONS
         *(COMMON)
     } > APP :data
 
-    /* The loader sets PSP and initializes the PT_LOAD segments before entry. */
-    __user_stack_top = ORIGIN(APP) + LENGTH(APP);
-    __user_stack_bottom = __user_stack_top - 4K;
-    ASSERT(ADDR(.bss) + SIZEOF(.bss) <= __user_stack_bottom,
-           "user image overlaps the reserved stack")
+    /* The kernel initializes the PT_LOAD segments and sets PSP before entry. */
+    __user_stack_bottom = ORIGIN(STACK);
+    __user_stack_top = ORIGIN(STACK) + LENGTH(STACK);
+    ASSERT((_start & ~1) == ORIGIN(APP), "user entry must start at APP origin")
 }
