@@ -103,15 +103,14 @@ ELF 带有入口、段表、符号和调试信息，可用于检查和调试。�
 
 先从板卡供应商找与这六根引脚和 W25Q64JV 同时匹配的 `.stldr`。如果没有，经验证后可用 ST 的 external loader 工程模板改造，设置 `0x9000_0000`、8 MiB、256 B 页和 4 KiB 扇区，按本板初始化 Bank 1。STM32H743I-EVAL 的官方样例适合作为移植参考，它的外部 Flash 型号与本板不同。也可以为 probe-rs 编写匹配的 Flash algorithm 和 target 描述。当前本机 `probe-rs chip info STM32H743VGTx` 即使列出外部 NVM 地址范围，也只凭这个输出无法确认算法、板级引脚和器件一致。见 [ST external loader 工程](https://github.com/STMicroelectronics/stm32-memory-loaders) 和 [probe-rs Flash algorithm 说明](https://probe.rs/docs/knowledge-base/cmsis-packs/)。
 
-匹配的 loader 和 `apps.img` 准备好后，用 CubeProgrammer 的命令行可按下面的形式烧录。需要用支持该工具的探针，例如 ST-LINK。路径是待替换的示例。
+匹配的 loader 和 `apps.img` 准备好后，在仓库根目录用 Makefile 调用 CubeProgrammer。默认 loader 可用 `make qspi-loader` 获取。使用其他 loader 时，传入实际路径。连接需要 ST-LINK 和已接好的 NRST。
 
 ```bash
-STM32_Programmer_CLI -c port=SWD \
-  -el /path/to/board-w25q64jv.stldr \
-  -w apps.img 0x90000000 -v
+make qspi-read QSPI_LOADER=/path/to/board-w25q64jv.stldr
+make qspi-write QSPI_LOADER=/path/to/board-w25q64jv.stldr QSPI_IMAGE=apps.img
 ```
 
-这里的 `0x90000000` 是 loader 对外公布的基址，对应 NOR 内部偏移 0。先确认该区域没有需要保留的数据。先用一个已确认空闲的扇区写短样本，核对回读和断电重启后的结果，再烧正式镜像。若没有合适的 loader，可写单独的板上测试固件，经 SWD 把样本放进 SRAM，调用 NOR 擦写函数并回读。正式内核第一版保留读取能力就够了。见 [STM32CubeProgrammer CLI 的 `-w`、`-v` 和 `-el`](https://dev.st.com/stm32cube-docs/prog/2.23.0/en/docs/markup/CubeProg_Command_Lines.html)。
+默认写入地址 `0x90000000` 是 loader 对外公布的基址，对应 NOR 内部偏移 0。先确认镜像涉及的完整扇区都可擦除。首次使用 loader 时，用 `QSPI_ADDR` 指向已确认空闲的扇区，写短样本并在断电重启后核对回读。若没有合适的 loader，可写单独的板上测试固件，经 SWD 把样本放进 SRAM，调用 NOR 擦写函数并回读。正式内核第一版保留读取能力就够了。见 [Makefile 用法](../README.md#构建与烧录)和 [STM32CubeProgrammer CLI 的 `-w`、`-v` 和 `-el`](https://dev.st.com/stm32cube-docs/prog/2.23.0/en/docs/markup/CubeProg_Command_Lines.html)。
 
 ## 4. 启动后怎么把 QSPI 里的程序搬进内存
 

@@ -4,15 +4,29 @@
 
 ## 构建与烧录
 
-安装 Rust stable、目标组件和 probe-rs。仅编译时需要 Rust 工具链和目标组件。
+安装 Rust stable、目标组件和 GNU Make。编译生成的内核 ELF 位于 `target/thumbv7em-none-eabihf/debug/kr-stm-os`。
 
 ```sh
 rustup target add thumbv7em-none-eabihf
-cargo build --locked
-cargo build --release --locked
+make                      # 构建调试版内核
+make PROFILE=release      # 构建发布版内核
+make build-apps           # 构建 user crate 的应用 ELF
 ```
 
-调试版 ELF 默认生成在 `target/thumbv7em-none-eabihf/debug/kr-stm-os`。连接 ST-Link 等 SWD 探针后，用以下命令确认 probe-rs 能访问探针，再构建、烧录并运行固件。
+使用 STM32CubeProgrammer 烧录时，将 ST-LINK 的 SWD 和 NRST 接到板上。`make flash-kernel` 重新构建内核，并按 ELF 中的地址写入片内 Flash 后校验。默认连接参数是 Under Reset、硬件复位和 100 kHz。可用 `SWD_ARGS='port=SWD mode=UR reset=HWrst freq=950'` 覆盖。CLI 名称不同时，可以传入 `PROGRAMMER=STM32_Programmer_CLI`。
+
+```sh
+make flash-kernel
+make qspi-loader
+make qspi-read
+make qspi-write QSPI_IMAGE=apps.img
+```
+
+`qspi-loader` 下载并校验 DevEBox 的 W25Q64 loader，默认保存到 `tools/flash/STM32H743VI_W25Q64.stldr`。其他板卡使用匹配的 `QSPI_LOADER=/绝对路径/board.stldr`。`qspi-read` 默认从 `0x90000000` 读 4096 字节到 `output/qspi-read.bin`，可以用 `QSPI_ADDR`、`QSPI_SIZE`（字节数）和 `QSPI_OUTPUT` 指定读回范围和文件。
+
+`qspi-write` 把原始镜像从 `QSPI_ADDR` 写入外部 Flash 并校验，起点须按 4 KiB 扇区对齐。写入前确认覆盖到的整个扇区都可擦除。`make build-apps` 当前产出 ELF，`apps.img` 需事先打包。见[镜像格式](docs/batch-implementation.md#31-先认识-elf-和-appsimg)。
+
+也可以用 probe-rs 烧录并运行内核。
 
 ```sh
 probe-rs list
