@@ -31,17 +31,17 @@ impl W25q64jv {
         Ok(id)
     }
 
-    pub fn read_at(&mut self, offize: u32, buffer: &mut [u8]) -> Result<(), FlashError> {
+    pub fn read_at(&mut self, offset: u32, buffer: &mut [u8]) -> Result<(), FlashError> {
         const FLASH_SIZE: u32 = 8 * 1024 * 1024;
         const MAX_READ_SIZE: usize = 32;
         let len = u32::try_from(buffer.len()).map_err(|_| FlashError::OutOfBounds)?;
-        let end = offize.checked_add(len).ok_or(FlashError::OutOfBounds)?;
+        let end = offset.checked_add(len).ok_or(FlashError::OutOfBounds)?;
 
         if end > FLASH_SIZE {
             return Err(FlashError::OutOfBounds);
         }
 
-        let mut addr = offize;
+        let mut addr = offset;
         for chunk in buffer.chunks_mut(MAX_READ_SIZE) {
             self.qspi
                 .read_extended(

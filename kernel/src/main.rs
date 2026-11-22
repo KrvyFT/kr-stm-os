@@ -24,11 +24,9 @@ fn main() -> ! {
     board.console.wait_for_write();
     board.led.set_high();
 
-    let id = W25q64jv::new(board.qspi).jedec_id().unwrap();
-    let mut text = heapless::String::<16>::new();
-    write!(&mut text, "{:02X} {:02X} {:02X}\r\n", id[0], id[1], id[2]).unwrap();
+    let mut flash = W25q64jv::new(board.qspi);
 
-    console::try_print(&text).unwrap();
-    board.console.wait_for_write();
+    batch::inspect(&mut flash, &mut board.console);
+
     panic!("Done!");
 }
