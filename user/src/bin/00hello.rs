@@ -6,5 +6,5 @@ use user_lib::println;
 #[unsafe(no_mangle)]
 fn main() -> i32 {
     println!("Hello World!");
-    0
+    47
 }

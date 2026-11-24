@@ -17,7 +17,7 @@ use stm32h7xx_hal::{
 pub(crate) use panic_dma::write as write_panic;
 
 const TX_QUEUE_CAPACITY: usize = 1024;
-const MAX_MESSAGE_BYTES: usize = 128;
+pub(crate) const MAX_MESSAGE_BYTES: usize = 128;
 static TX_QUEUE: Mutex<RefCell<Deque<u8, TX_QUEUE_CAPACITY>>> =
     Mutex::new(RefCell::new(Deque::new()));
 
@@ -27,8 +27,12 @@ pub enum WriteError {
     Full,
 }
 
-/// Enqueues the entire UTF-8 message, or leaves the queue untouched on error.
 pub fn try_print(message: &str) -> Result<(), WriteError> {
+    try_write(message.as_bytes())
+}
+
+/// Enqueues the entire message, or leaves the queue untouched on error.
+pub(crate) fn try_write(message: &[u8]) -> Result<(), WriteError> {
     if message.len() > MAX_MESSAGE_BYTES {
         return Err(WriteError::TooLong);
     }
@@ -40,7 +44,7 @@ pub fn try_print(message: &str) -> Result<(), WriteError> {
             return Err(WriteError::Full);
         }
 
-        for byte in message.bytes() {
+        for &byte in message {
             let _ = queue.push_back(byte);
         }
         Ok(())

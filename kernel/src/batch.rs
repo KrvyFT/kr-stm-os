@@ -8,9 +8,9 @@ use crate::{
 use image::Image;
 pub(crate) use image::ImageError;
 
-const APP_START: u32 = 0x2406_0000;
+pub(crate) const APP_START: u32 = 0x2406_0000;
 const APP_END: u32 = 0x2407_f000;
-const APP_STACK_TOP: u32 = 0x2408_0000;
+pub(crate) const APP_STACK_TOP: u32 = 0x2408_0000;
 
 pub fn inspect(flash: &mut W25q64jv, console: &mut ConsoleDriver) {
     let result = (|| {
@@ -59,6 +59,7 @@ pub(crate) unsafe fn run(
             let app = loader::load(&mut image, index)?;
             trap::run_app(app.entry, app.stack_top)
         };
+        console.wait_for_write();
         console.print_fmt(format_args!("app[{index}] exited: {code}\r\n"));
     }
     console.print_fmt(format_args!("Batch complete\r\n"));

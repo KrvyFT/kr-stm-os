@@ -4,7 +4,7 @@
 
 当前的 [镜像解析器](../kernel/src/batch/image.rs) 已在 `Image::open()` 中校验 CRC，[加载器](../kernel/src/batch/loader.rs) 已按段推进 QSPI 读取偏移，并清零内存中多出来的部分。[内核入口](../kernel/src/main.rs) 通过 `batch::run()` 复用 `loader::load()`。下面按文件说明怎么把这条路径接起来。
 
-本阶段只运行自己构建的整数测试应用。`SVCall` 识别基本异常帧，只处理启动和退出。应用使用 PSP 和非特权 Thread mode，内存隔离还需要 MPU。现有 `00hello` 和 `01store_fault` 会调用 `println!`，请用 `APPS=00exit42` 打包本轮镜像。
+本阶段只运行自己构建的整数测试应用。`SVCall` 识别基本异常帧，处理启动、写入和退出。应用使用 PSP 和非特权 Thread mode，内存隔离还需要 MPU。现有 `00hello` 和 `01store_fault` 会调用 `println!`，请用 `APPS=00exit42` 打包本轮镜像。
 
 ## 1. 先看清两条栈怎么交接
 
@@ -111,7 +111,7 @@ SVCall:
 
     mvn.w   r1, #2
     cmp     lr, r1
-    beq     .Lexit_app
+    beq     .Luser_svc
     b       .Lunsupported_svc
 
 .Lstart_app:
@@ -140,15 +140,20 @@ SVCall:
     mvn.w   lr, #2
     bx      lr
 
-.Lexit_app:
+.Luser_svc:
     mrs     r0, PSP
     ldr     r2, [r0, #24]
     subs    r2, #2
     ldrh    r2, [r2]
     movw    r1, #0xdf01
     cmp     r2, r1
-    bne     .Lunsupported_svc
+    beq     .Lexit_app
+    movw    r1, #0xdf02
+    cmp     r2, r1
+    beq     .Lwrite_app
+    b       .Lunsupported_svc
 
+.Lexit_app:
     ldr     r0, [r0]
     ldmia   sp!, {r3-r11, lr}
     str     r0, [sp]
@@ -156,6 +161,16 @@ SVCall:
     movs    r1, #0
     msr     CONTROL, r1
     isb
+    bx      lr
+
+.Lwrite_app:
+    push    {r4, lr}
+    mov     r4, r0
+    ldr     r0, [r4]
+    ldr     r1, [r4, #4]
+    bl      __kr_sys_write
+    str     r0, [r4]
+    ldmia   sp!, {r4, lr}
     bx      lr
 
 .Lunsupported_svc:
@@ -182,14 +197,49 @@ SVCall:
 
 `SVCall` 是向量表使用的符号名。`.global SVCall` 导出它供链接器解析，`.thumb_func` 标记 Thumb 函数入口。未匹配的 SVC 和扩展浮点帧会走 `udf #0`，以 Fault 暴露当前不支持的路径。项目编译目标使用 `eabihf`，这里要根据运行时的 `EXC_RETURN` 判断帧类型。
 
+### 3.3 应用通过 `svc #2` 写入并继续运行
+
+应用执行 `svc #2` 后，`.Luser_svc` 读出 `0xdf02`，转到 `.Lwrite_app`。此时活 `r0` 指向应用基本帧。`push {r4, lr}` 把应用的 `r4` 和本次 `EXC_RETURN` 保存到 MSP，正好占 8 字节。把帧地址暂存到 `r4`，是因为 C ABI 要求被调用者保留它，而 `r0` 和 `r1` 要用来传入应用帧中的缓冲区地址和长度。`bl` 会覆盖 LR，所以调用前必须保留异常返回令牌。
+
+Rust 返回后，`str r0, [r4]` 把结果写回 **PSP 上的应用帧**。汇编只弹出写入分支自己压入的两个字，再按原令牌异常返回，应用从 SVC 的下一条指令继续。内核等待退出的现场仍保留在 MSP 上。
+
+```rust
+#[unsafe(no_mangle)]
+extern "C" fn __kr_sys_write(addr: u32, len: u32) -> i32 {
+    const EAGAIN: i32 = -11;
+    const EFAULT: i32 = -14;
+    const EMSGSIZE: i32 = -90;
+
+    if len == 0 {
+        return 0;
+    }
+    if len as usize > MAX_MESSAGE_BYTES {
+        return EMSGSIZE;
+    }
+    if addr < APP_START || addr.checked_add(len).is_none_or(|end| end > APP_STACK_TOP) {
+        return EFAULT;
+    }
+
+    // SAFETY: The current batch runner admits trusted apps whose sys_write
+    // passes an initialized byte slice. The range check covers code/data and PSP.
+    let bytes = unsafe { slice::from_raw_parts(addr as *const u8, len as usize) };
+    match console::try_write(bytes) {
+        Ok(()) => len as i32,
+        Err(WriteError::TooLong) => EMSGSIZE,
+        Err(WriteError::Full) => EAGAIN,
+    }
+}
+```
+
+检查按固定顺序进行。零长度直接返回 0。超过 128 字节返回 `-90`。其余请求用 `checked_add` 计算排他末地址，区间必须落在 `[APP_START, APP_STACK_TOP)`，溢出或越界返回 `-14`。`try_write(&[u8])` 在短临界区内把合法数据整段复制到 1024 字节队列，返回入队字节数。队列装不下时返回 `-11`，原队列保持不变。`try_print(&str)` 也复用该字节接口，因此内核文本和应用字节按实际入队顺序发送。
+
+范围检查覆盖整块应用 SRAM，包含 PSP 栈和段间空洞。代码依赖受信任的应用传入已初始化字节，运行时隔离仍需 MPU。handler 使用独立的全局队列接口，因此无需取得第二份控制台驱动的可变借用。外层批处理等到应用退出后轮询排空队列，再打印退出码。写入返回 5 表示已接收 5 字节，串口此时仍可能没有输出。 [写入实现](../kernel/src/trap.rs) · [控制台](../kernel/src/drivers/console.rs) · [批处理](../kernel/src/batch.rs)
+
 ## 4. 接进批处理循环和内核入口
 
 在 [batch.rs](../kernel/src/batch.rs) 中定义以下函数。它借用已经初始化的 Flash 和控制台驱动，格式化和发送由控制台自己的 `print_fmt()` 完成。
 
 ```rust
-/// # Safety
-/// Call in privileged Thread mode on MSP with SVC available.
-/// The image must contain trusted apps that use basic exception frames.
 pub(crate) unsafe fn run(
     flash: &mut W25q64jv,
     console: &mut ConsoleDriver,
@@ -202,6 +252,7 @@ pub(crate) unsafe fn run(
             let app = loader::load(&mut image, index)?;
             trap::run_app(app.entry, app.stack_top)
         };
+        console.wait_for_write();
         console.print_fmt(format_args!("app[{index}] exited: {code}\r\n"));
     }
     console.print_fmt(format_args!("Batch complete\r\n"));
@@ -302,7 +353,7 @@ GDB 中用 `disassemble __kr_run_app` 找到 `svc #0` 后面那条 `bx lr` 的�
 | --- | --- |
 | 打印 `KAPP error: BadCrc` | 确认烧入的是本轮 `apps-exit42.img`。需要时用 Makefile 的 `qspi-read` 读回相同长度，然后用 `cmp` 比较 |
 | 启动 SVC 没有命中 `SVCall` | 查看内核 ELF 中的 `SVCall` 和向量表第 11 项。确认运行的是刚构建的内核，且 SVC 没被屏蔽 |
-| 进入 `.Lunsupported_svc` | 查看 LR 和堆栈里的 PC。若应用先执行了 `svc #2`，检查镜像内容。若 LR 指示扩展帧，检查内核和应用是否执行了浮点路径 |
+| 进入 `.Lunsupported_svc` | 查看 LR 和堆栈里的 PC。基本 PSP 帧下读 `PC - 2`，检查是否为未知 SVC 编号。若 LR 指示扩展帧，检查内核和应用是否执行了浮点路径 |
 | 已到启动分支，首次 `bx lr` 就触发 Fault | 核对 PSP 对齐、初始 PC、`xPSR.T` 和 `EXC_RETURN`。可在 Fault 处读 `CFSR`（`0xe000ed28`）与 `HFSR`（`0xe000ed2c`） |
 | 能进应用，但退出后挂住 | 检查退出分支有没有把 `42` 写回内核帧的 `r0`，以及 `ldmia` 后 MSP 是否正好回到内核硬件帧 |
 

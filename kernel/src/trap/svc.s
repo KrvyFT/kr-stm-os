@@ -24,7 +24,7 @@ SVCall:
 
     mvn.w   r1, #2
     cmp     lr, r1
-    beq     .Lexit_app
+    beq     .Luser_svc
     b       .Lunsupported_svc
 
 .Lstart_app:
@@ -53,15 +53,20 @@ SVCall:
     mvn.w   lr, #2
     bx      lr
 
-.Lexit_app:
+.Luser_svc:
     mrs     r0, PSP
-    ldr     r2, [r0, #24]
+    ldr     r2, [r0, #24]2
     subs    r2, #2
     ldrh    r2, [r2]
     movw    r1, #0xdf01
     cmp     r2, r1
-    bne     .Lunsupported_svc
+    beq     .Lexit_app
+    movw    r1, #0xdf02
+    cmp     r2, r1
+    beq     .Lwrite_app
+    b       .Lunsupported_svc
 
+.Lexit_app:
     ldr     r0, [r0]
     ldmia   sp!, {r3-r11, lr}
     str     r0, [sp]
@@ -69,6 +74,16 @@ SVCall:
     movs    r1, #0
     msr     CONTROL, r1
     isb
+    bx      lr
+
+.Lwrite_app:
+    push    {r4, lr}
+    mov     r4, r0
+    ldr     r0, [r4]
+    ldr     r1, [r4, #4]
+    bl      __kr_sys_write
+    str     r0, [r4]
+    ldmia   sp!, {r4, lr}
     bx      lr
 
 .Lunsupported_svc:

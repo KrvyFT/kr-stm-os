@@ -36,7 +36,7 @@ Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指
 
 panic 缓冲区位于 AXI SRAM 的 `.bss`。如果将来调整链接布局，需要继续把它放在 DMA1 可访问的内存，并保留 32 字节对齐。[DMA 缓冲区与缓存维护](dma-panic.md#3-准备-dma-能读到的消息)
 
-`cargo build --locked -p user_lib --bin 00hello` 生成应用 ELF。内核装载可加载段并设置 PSP，应用从 Rust 的 [`_start`](../user/src/runtime.rs) 进入，调用 `main()`，再把返回值交给 `exit()`。`00hello` 在返回前会请求用户态写入，当前内核的 SVC 处理只支持进入和退出。
+`cargo build --locked -p user_lib --bin 00hello` 生成应用 ELF。内核装载可加载段并设置 PSP，应用从 Rust 的 [`_start`](../user/src/runtime.rs) 进入，调用 `main()`，再把返回值交给 `exit()`。`00hello` 在返回 `47` 前通过 `svc #2` 提交打印。写入结果经 PSP 帧返回应用，应用退出后批处理排空串口队列再打印退出码。
 
 用户库的 [`lib.rs`](../user/src/lib.rs) 从运行时导出应用使用的 `write` 和 `exit` 接口。[用户态控制台](../user/src/console.rs) 将格式化结果交给 `write`，运行时内部的[系统调用模块](../user/src/runtime/syscall.rs) 处理 SVC 编号和传参寄存器。
 
@@ -46,7 +46,7 @@ panic 缓冲区位于 AXI SRAM 的 `.bss`。如果将来调整链接布局，需
 
 ## 普通串口输出
 
-- `console::try_print(&str)` 尝试把一条消息完整追加到 1 024 字节的队列。单条上限为 128 字节，超过时返回 `WriteError::TooLong`。剩余空间不足时返回 `WriteError::Full`。两种失败均发生在写入队列之前，长度按 UTF-8 字节计算。
+- `console::try_print(&str)` 复用 `try_write(&[u8])`。两者都尝试把一条消息完整追加到 1 024 字节的队列。单条上限为 128 字节，超过时返回 `WriteError::TooLong`。剩余空间不足时返回 `WriteError::Full`。两种失败均发生在写入队列之前，长度按字节计算。
 - `ConsoleDriver::poll()` 每次尝试发送一个字节。USART1 暂时无法接收下一个字节时，驱动将该字节留在 `pending`，下一次轮询先重试它。
 - `ConsoleDriver::wait_for_write()` 反复调用 `poll()`，直到队列为空、没有待重试字节，且 HAL 的 `flush()` 确认 USART 的 `TC` 置位。这是阻塞等待，依赖 USART 正常推进，当前用于启动演示的输出顺序。
 

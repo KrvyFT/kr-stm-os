@@ -10,5 +10,5 @@ fn main() -> i32 {
     unsafe {
         core::ptr::null_mut::<u8>().write_volatile(0);
     }
-    0
+    57
 }

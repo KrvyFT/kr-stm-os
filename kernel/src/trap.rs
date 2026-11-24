@@ -1,4 +1,9 @@
-use core::arch::global_asm;
+use core::{arch::global_asm, slice};
+
+use crate::{
+    batch::{APP_STACK_TOP, APP_START},
+    drivers::console::{self, MAX_MESSAGE_BYTES, WriteError},
+};
 
 #[repr(C)]
 struct BasicExceptionFrame {
@@ -38,6 +43,32 @@ pub(crate) unsafe fn run_app(entry: u32, stack_top: u32) -> i32 {
             xpsr: 1 << 24,
         });
         __kr_run_app(frame)
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn __kr_sys_write(addr: u32, len: u32) -> i32 {
+    const EAGAIN: i32 = -11;
+    const EFAULT: i32 = -14;
+    const EMSGSIZE: i32 = -90;
+
+    if len == 0 {
+        return 0;
+    }
+    if len as usize > MAX_MESSAGE_BYTES {
+        return EMSGSIZE;
+    }
+    if addr < APP_START || addr.checked_add(len).is_none_or(|end| end > APP_STACK_TOP) {
+        return EFAULT;
+    }
+
+    // SAFETY: The current batch runner admits trusted apps whose sys_write
+    // passes an initialized byte slice. The range check covers code/data and PSP.
+    let bytes = unsafe { slice::from_raw_parts(addr as *const u8, len as usize) };
+    match console::try_write(bytes) {
+        Ok(()) => len as i32,
+        Err(WriteError::TooLong) => EMSGSIZE,
+        Err(WriteError::Full) => EAGAIN,
     }
 }
 
