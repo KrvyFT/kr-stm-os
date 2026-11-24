@@ -1,6 +1,9 @@
 mod panic_dma;
 
-use core::cell::RefCell;
+use core::{
+    cell::RefCell,
+    fmt::{self, Write as _},
+};
 
 use cortex_m::interrupt::{self, Mutex};
 use heapless::Deque;
@@ -59,6 +62,16 @@ impl ConsoleDriver {
             _panic_dma: panic_dma,
             pending: None,
         }
+    }
+
+    /// Formats a message and waits for it to be sent.
+    ///
+    /// Panics if the message does not fit in the buffer or queue.
+    pub(crate) fn print_fmt(&mut self, args: fmt::Arguments<'_>) {
+        let mut message = heapless::String::<MAX_MESSAGE_BYTES>::new();
+        message.write_fmt(args).unwrap();
+        try_print(message.as_str()).unwrap();
+        self.wait_for_write();
     }
 
     /// Attempts to write one byte, retaining it while USART1 is busy.

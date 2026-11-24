@@ -1,6 +1,6 @@
 # kr-stm-os
 
-面向 STM32H743VGT6 的 Rust 裸机项目，为后续编写操作系统建立启动和诊断基础。当前固件初始化板级外设，通过 USART1 输出启动消息，切换 PC13 电平，读取并打印 QSPI Flash 的 JEDEC ID，然后主动触发一次 panic 来演示 DMA 输出。
+面向 STM32H743VGT6 的 Rust 裸机系统。内核初始化板级外设，通过 USART1 输出启动消息，再从 QSPI 读取 KAPP 镜像。批处理循环把应用逐个装入 AXI SRAM，通过 Cortex-M7 的 PSP 和 SVC 启动应用并接收退出码。
 
 ## 项目结构
 
@@ -54,20 +54,24 @@ Cargo runner 使用 `probe-rs run --chip STM32H743VGTx`。VS Code 可以安装 p
 
 ## 查看串口输出
 
-将 MCU 的 PA9 接到 3.3 V USB 转串口的 RX，两侧 GND 相连。只观察输出时，PA10 可以留空。串口终端设为 **19 200 baud、8N1、无流控**。打开串口后复位，预期看到：
+将 MCU 的 PA9 接到 3.3 V USB 转串口的 RX，两侧 GND 相连。只观察输出时，PA10 可以留空。串口终端设为 **19 200 baud、8N1、无流控**。
+
+当前 SVC 支持启动与退出。验证批处理时，按[应用启动与退出指南](docs/svc-app-start-exit.md#5-用退出码-42-做第一次验收)创建并单独打包整数测试应用。`00hello` 和 `01store_fault` 会先调用尚未接入的用户态写入服务。测试镜像运行到退出时，预期日志如下。
 
 ```text
 kr-stm-os booted
-<三字节 JEDEC ID>
+app[0] exited: 42
+Batch complete
 
 [kernel panic]
 Panicked at kernel/src/main.rs:<行号> Done!
 ```
 
-panic 段带 ANSI 红色序列。启动期间 PC13 先被拉低，在启动消息的最后一帧发完后被拉高。LED 亮灭取决于板载电路的极性。panic handler 最后进入自旋，复位可再次运行此演示。
+当前入口在批处理返回后仍执行 `panic!("Done!")` 来演示 DMA 输出，panic 段带 ANSI 红色序列。启动期间 PC13 先被拉低，在启动消息的最后一帧发完后被拉高。LED 亮灭取决于板载电路的极性。
 
 ## 开发文档
 
 - [代码结构与启动流程](docs/architecture.md) 说明模块职责、链接布局、控制台接口和验证方式。
 - [DMA panic 输出](docs/dma-panic.md) 说明缓冲区、缓存维护、寄存器顺序和板上观察点。
 - [批处理系统实施指南](docs/batch-implementation.md) 从 W25Q64JV 接线、烧录和装载讲到 Cortex-M7 应用切换及串口共享。
+- [应用启动与退出指南](docs/svc-app-start-exit.md) 说明基本异常帧、SVC 进入和退出链路，以及如何验证退出码。

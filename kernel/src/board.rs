@@ -6,15 +6,15 @@ use stm32h7xx_hal::{
     rcc::RccExt,
     serial::SerialExt,
     time::{Hertz, U32Ext},
-    xspi::{Qspi, XspiExt},
+    xspi::XspiExt,
 };
 
-use crate::console::ConsoleDriver;
+use crate::drivers::{console::ConsoleDriver, qspi::W25q64jv};
 
 pub struct Board {
     pub console: ConsoleDriver,
     pub led: PC13<Output>,
-    pub qspi: Qspi<pac::QUADSPI>,
+    pub flash: W25q64jv,
 }
 
 impl Board {
@@ -59,7 +59,7 @@ impl Board {
         Self {
             console: ConsoleDriver::new(tx, dma.0),
             led,
-            qspi: qspi,
+            flash: W25q64jv::new(qspi),
         }
     }
 }

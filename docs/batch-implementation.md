@@ -2,7 +2,7 @@
 
 目标是在 STM32H743VGT6 上从片内 Flash 启动内核，从板载 W25Q64JV 读取应用镜像，把每个应用装入 AXI SRAM，逐个在非特权态运行。第一版验收时，串口应显示两个应用按顺序运行并退出，最后显示批处理完成。
 
-当前内核启动时读取 W25Q64JV 的 JEDEC ID，打印后执行 `panic!("Done!")` 演示。用户 crate 提供 `hello`、应用链接脚本和 Thumb 入口，主机打包器生成 `output/apps.img`。内核侧的应用装载、SVC 分派和 MPU 配置是接下来要实现的内容。板级接线来自你提供的 W25Q64JV 原理图片段，本文没有做实板读写或烧录验证。相关代码见 [内核入口](../kernel/src/main.rs)、[板级初始化](../kernel/src/board.rs)、[应用链接脚本](../user/link.x) 和 [应用入口](../user/src/runtime.rs)。
+当前内核可以从 W25Q64JV 装载 KAPP 镜像，使用 SVC 进入应用并获取退出码。用户 crate 提供示例应用、应用链接脚本和 Thumb 入口，主机打包器生成 `output/apps.img`。验证基本 SVC 路径请使用只返回整数的测试应用。板级接线来自你提供的 W25Q64JV 原理图片段，本文没有做实板读写或烧录验证。相关代码见 [内核入口](../kernel/src/main.rs)、[板级初始化](../kernel/src/board.rs)、[应用链接脚本](../user/link.x) 、[应用入口](../user/src/runtime.rs) 和 [应用启动与退出指南](svc-app-start-exit.md)。
 
 ## 1. 先分清三种地址
 
@@ -59,7 +59,7 @@ W25Q64JV 的 64 Mbit 对应 8 MiB。**页**是编程边界，大小 256 B。**�
 
 ### 2.3 在当前项目怎么接入
 
-1. 在 `kernel/src/qspi.rs` 封装 Flash。由 `Board::init()` 在现有 PWR/RCC 初始化之后，配置 GPIOB、GPIOD、GPIOE 的复用和 QUADSPI 时钟及复位，把 Flash 句柄交给 `Board`。PB6 片选也要配置成 AF10。HAL 示例单独设置片选 GPIO，照抄 `bank1()` 的时钟和 IO 参数容易漏掉它。
+1. 在 `kernel/src/drivers/qspi.rs` 封装 Flash。由 `Board::init()` 在现有 PWR/RCC 初始化之后，配置 GPIOB、GPIOD、GPIOE 的复用和 QUADSPI 时钟及复位，把 Flash 句柄交给 `Board`。PB6 片选也要配置成 AF10。HAL 示例单独设置片选 GPIO，照抄 `bank1()` 的时钟和 IO 参数容易漏掉它。
 2. 配置单芯片、Bank 1、低速、符合 NOR 要求的时钟模式和片选高电平间隔。间接普通读使用 24 位地址。控制器的设备大小 `FSIZE` 用的是地址位数减一，8 MiB 等于 `2^23` 字节，对应 `FSIZE = 22`。地址阶段仍发送 24 位，容量和传输地址长度各有用途。
 3. 先实现 `jedec_id()`，使其只发指令并读三个字节，不添加地址。接着实现 `read_at(offset, &mut [u8])`，用 `checked_add` 检查读区间，空缓冲区直接返回。底层等待应可超时。带长度上限的 HAL 操作按其支持的大小分块，失败就报告偏移和错误。
 4. 用间接读先跑通整个批处理。后续需要改善吞吐量时，再尝试 Quad fast read 或 memory-mapped。映射模式由控制器把 CPU 读转换为 NOR 事务。通过 `0x9000_0000` 窗口直接写内存无法完成 NOR 页编程。本文应用链接到 SRAM，切到 QSPI 原地执行还要重新安排应用链接地址。
@@ -175,7 +175,7 @@ SVC 是程序主动执行的指令，行为类似 `krunix` 的 `ecall`。IRQ 由
 
 建议用 `svc #imm` 区分调用，例如内核启动用 `#0`，用户退出用 `#1`，用户写入用 `#2`。对写入，`r0` 放用户缓冲区指针，`r1` 放字节长度。裸汇编入口用 `EXC_RETURN` 判定硬件帧来自哪条栈，必要时解析扩展帧，Rust 分派函数从基本帧读参数。若按立即数派发，在验证返回 PC 位于对应的可执行范围后，读 `stacked_pc - 2` 处的 Thumb 半字并检查它确实是 SVC 指令。保存的 PC 已经指向 SVC 后面，返回时原值即可。
 
-`write` 先对长度设上限，再用 checked arithmetic 验证整个切片在应用可读范围。空写入可直接返回 0，避免为任意空指针构造切片。把字节复制到内核拥有的队列，然后把写入结果放回异常帧的 `r0`。应用继续运行后可能马上复用原缓冲区，所以串口驱动应持有复制好的数据。用能够从 PSP 恢复该帧的实际 `EXC_RETURN` 返回。这个过程不需要另存一份应用的完整上下文。见 [当前串口队列](../kernel/src/console.rs) 和 [Arm Cortex-M7 手册，SVCall 与异常返回](https://documentation-service.arm.com/static/61efd8352dd99944d05142d1)。
+`write` 先对长度设上限，再用 checked arithmetic 验证整个切片在应用可读范围。空写入可直接返回 0，避免为任意空指针构造切片。把字节复制到内核拥有的队列，然后把写入结果放回异常帧的 `r0`。应用继续运行后可能马上复用原缓冲区，所以串口驱动应持有复制好的数据。用能够从 PSP 恢复该帧的实际 `EXC_RETURN` 返回。这个过程不需要另存一份应用的完整上下文。见 [当前串口队列](../kernel/src/drivers/console.rs) 和 [Arm Cortex-M7 手册，SVCall 与异常返回](https://documentation-service.arm.com/static/61efd8352dd99944d05142d1)。
 
 #### 第四步：应用退出，批处理循环拿回控制权
 
@@ -211,7 +211,7 @@ SVC 是程序主动执行的指令，行为类似 `krunix` 的 `ecall`。IRQ 由
 
 ### 6.1 现有代码已经提供的语义
 
-当前 `Board` 持有 `ConsoleDriver`。它独占 USART1 TX，另留 DMA1 Stream 0 给内核 panic。普通调用通过 `try_print(&str)` 把一条消息完整复制到 1024 B 队列。最多 128 B，剩余空间不足就返回 `Full`，队列不变。入队在短临界区里完成，所以**一次调用内的字节不会被另一个生产者插进去**。`poll()` 从队列取一个字节，USART 暂时忙时用 `pending` 保留它。只有主程序调用 `poll()` 或 `wait_for_write()`，普通输出才前进。UART 一条 TX 线一次发送一位，所谓同时发送实际是多个代码路径同时提交消息。见 [控制台实现](../kernel/src/console.rs) 和 [panic DMA 实现](../kernel/src/console/panic_dma.rs)。
+当前 `Board` 持有 `ConsoleDriver`。它独占 USART1 TX，另留 DMA1 Stream 0 给内核 panic。普通调用通过 `try_print(&str)` 把一条消息完整复制到 1024 B 队列。最多 128 B，剩余空间不足就返回 `Full`，队列不变。入队在短临界区里完成，所以**一次调用内的字节不会被另一个生产者插进去**。`poll()` 从队列取一个字节，USART 暂时忙时用 `pending` 保留它。只有主程序调用 `poll()` 或 `wait_for_write()`，普通输出才前进。UART 一条 TX 线一次发送一位，所谓同时发送实际是多个代码路径同时提交消息。见 [控制台实现](../kernel/src/drivers/console.rs) 和 [panic DMA 实现](../kernel/src/drivers/console/panic_dma.rs)。
 
 在 19200、8N1 下，一个数据字节通常占 10 个线路位。128 B 连续发完约 67 ms，1024 B 约 0.53 s。把一整条发送放进高优先级 handler 轮询，会让低优先级工作等很久。临界区只保护队列和发送状态的短操作，等待 UART 就绪应在临界区外。
 
@@ -235,7 +235,7 @@ IRQ 事件摘要 ───┘
 | **持续输出：TX IRQ 消费队列** | TX 就绪触发 USART1 ISR。ISR 在硬件可收时写入字节，队列空时关 TX 就绪中断。生产者重新入队后启动发送 | 适合要边运行边看日志的应用，不需要把驱动从主函数临时借给 SVC。需要用短临界区把“入队并启动”与“判空并关闭”协调起来 |
 | **后续扩展：DMA 分块** | DMA 从内核的发送缓冲区往 TDR 写字节，完成 IRQ 安排下一块 | 吞吐量更高。要管理 DMA 可访问的缓冲区、缓存一致性、块生命周期以及 panic 接管协议。在目前的 19200 波特率下优先把队列和 IRQ 做正确 |
 
-**推荐先用轮询验证退出，再切 TX IRQ。** 切换时只保留一个普通 TX 消费者。主程序和 SVC 入队，ISR 消费，UART TX 句柄由控制台驱动持有。不要在主程序持有队列借用或驱动可变借用时进入可能访问同一对象的 SVC，否则容易触发 `RefCell` 借用错误或违反独占访问。用 IRQ 版本时，等待冲洗应等待“队列空、无暂存字节、USART TC 为 1”，并让消费者中断能执行。TX 就绪表示 TDR 或 FIFO 能收下一个字节，TC 才表示最后一帧已从 TX 引脚发完。见 [STM32 RM0433，USART ISR/CR1](https://www.st.com/resource/en/reference_manual/rm0433-stm32h7-series-and-stm32h7rs-lines-armbased-32bit-mcus-stmicroelectronics.pdf) 和 [当前 wait_for_write](../kernel/src/console.rs)。
+**推荐先用轮询验证退出，再切 TX IRQ。** 切换时只保留一个普通 TX 消费者。主程序和 SVC 入队，ISR 消费，UART TX 句柄由控制台驱动持有。不要在主程序持有队列借用或驱动可变借用时进入可能访问同一对象的 SVC，否则容易触发 `RefCell` 借用错误或违反独占访问。用 IRQ 版本时，等待冲洗应等待“队列空、无暂存字节、USART TC 为 1”，并让消费者中断能执行。TX 就绪表示 TDR 或 FIFO 能收下一个字节，TC 才表示最后一帧已从 TX 引脚发完。见 [STM32 RM0433，USART ISR/CR1](https://www.st.com/resource/en/reference_manual/rm0433-stm32h7-series-and-stm32h7rs-lines-armbased-32bit-mcus-stmicroelectronics.pdf) 和 [当前 wait_for_write](../kernel/src/drivers/console.rs)。
 
 最容易漏掉的是**丢唤醒**。假设 ISR 看到队列空，线程随后入队并开中断，然后 ISR 又关了它，新数据就会一直停在队列。把队列状态和 TX 中断启停纳入同一同步协议。让生产者在提交成功后启用发送，让消费者在同一个临界区内确认队列仍空后关闭发送中断。应实际测试“队列从空变非空”和“最后一个字节送出时恰好新提交”两种情况。
 
@@ -247,11 +247,11 @@ IRQ 事件摘要 ───┘
 
 | 阶段 | 建议位置与工作 | 完成时应观察到什么 |
 | --- | --- | --- |
-| 1. QSPI 连通 | `kernel/src/board.rs` 接 GPIO、时钟与 QUADSPI，`kernel/src/qspi.rs` 实现 JEDEC ID 与 `read_at` | 稳定读到符合实物版本的 JEDEC ID。逻辑分析仪能区分 CS、CLK、命令和读出字节 |
+| 1. QSPI 连通 | `kernel/src/board.rs` 接 GPIO、时钟与 QUADSPI，`kernel/src/drivers/qspi.rs` 实现 JEDEC ID 与 `read_at` | 稳定读到符合实物版本的 JEDEC ID。逻辑分析仪能区分 CS、CLK、命令和读出字节 |
 | 2. 独立镜像 | 主机用 `make pack-apps` 生成镜像，内核解析只读目录，先用匹配 loader 烧入独立样本 | 烧录工具校验通过。断电重启后内核按顺序列出 `hello`、第二个应用与段信息。空白或损坏镜像有明确诊断 |
 | 3. 复制到 SRAM | 在 `kernel/src/batch/` 先实现镜像解析和装载，保持顶层入口只负责编排 | 在调试器里对比目标内存、入口机器码和段内容。长度溢出、越过应用区、无效 Thumb 入口和错误 CRC 都被拒绝 |
 | 4. 进入和退出 | `kernel/src/trap/` 放 ARM 异常入口、帧定义和 SVC 分派，应用入口接退出调用 | 先让整数版 `hello` 返回 0，再跑两个不同返回码。验证 PSP/MSP、特权级以及最后一个应用完成后返回内核 |
-| 5. 应用打印 | `kernel/src/console.rs` 统一提交接口，先在应用退出后排队冲洗 | 内核日志和应用日志按提交顺序出现。坏指针、超过 128 B 和队列满均有确定返回，无半条入队 |
+| 5. 应用打印 | `kernel/src/drivers/console.rs` 统一提交接口，先在应用退出后排队冲洗 | 内核日志和应用日志按提交顺序出现。坏指针、超过 128 B 和队列满均有确定返回，无半条入队 |
 | 6. 权限与持续输出 | 接 MPU、应用 Fault 处理、USART1 TX IRQ。超时和抢占可另外验证 | 测试应用尝试访问被禁止的地址时记录原因并继续下一个应用。运行中的应用能持续输出，压力测试无交错、无丢唤醒 |
 
 每次只新增一个可观测现象。先证明 QSPI 能读，再证明 RAM 写对，最后才看应用能否执行。这三个检查点分属外设、加载器和 CPU 异常机制，能大幅缩小排查范围。

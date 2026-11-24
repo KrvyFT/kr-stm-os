@@ -3,17 +3,13 @@
 
 mod batch;
 mod board;
-mod console;
+mod drivers;
 mod panic_handler;
-mod qspi;
-
-use core::fmt::Write;
+mod trap;
 
 use cortex_m_rt::entry;
 
-use board::Board;
-
-use crate::qspi::W25q64jv;
+use crate::{board::Board, drivers::console};
 
 #[entry]
 fn main() -> ! {
@@ -24,9 +20,14 @@ fn main() -> ! {
     board.console.wait_for_write();
     board.led.set_high();
 
-    let mut flash = W25q64jv::new(board.qspi);
-
-    batch::inspect(&mut flash, &mut board.console);
+    // SAFETY: Boot is in privileged Thread mode on MSP. The batch image
+    // is provisioned with trusted apps that use the basic exception frame.
+    let result = unsafe { batch::run(&mut board.flash, &mut board.console) };
+    if let Err(error) = result {
+        board
+            .console
+            .print_fmt(format_args!("KAPP error: {error:?}\r\n"));
+    }
 
     panic!("Done!");
 }

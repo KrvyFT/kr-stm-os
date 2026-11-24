@@ -21,7 +21,7 @@ let driver = ConsoleDriver::new(tx, dma.0);
 
 `dma.0` 的类型是 `Stream0<DMA1>`。驱动把它保存在 `_panic_dma` 字段里，表示这条 Stream 已经由控制台保留。正常的 `poll()` 使用 `Tx<USART1>` 逐字节发送。只有 panic 路径会用到这条 DMA Stream。
 
-`ConsoleDriver::new()` 调用 `panic_dma::arm()`，后者通过 `PANIC_DMA_READY.store(true, Ordering::Release)` 发布就绪状态。这时 USART1 已经配置好，DMA1 的时钟也已经打开。 [控制台驱动](../kernel/src/console.rs)
+`ConsoleDriver::new()` 调用 `panic_dma::arm()`，后者通过 `PANIC_DMA_READY.store(true, Ordering::Release)` 发布就绪状态。这时 USART1 已经配置好，DMA1 的时钟也已经打开。 [控制台驱动](../kernel/src/drivers/console.rs)
 
 ## 2. 进入 panic handler 并取得使用权
 
@@ -39,19 +39,19 @@ if !PANIC_DMA_READY.swap(false, Ordering::AcqRel) {
 - 旧值为 `true` 时，本次 panic 取得缓冲区和 DMA Stream 的使用权。
 - 旧值为 `false` 时，初始化尚未完成，或者前一次 panic 已经取得使用权。函数直接返回，handler 随后停机。
 
-原子交换也处理了重入。例如格式化错误信息时再次 panic，第二次调用会看到 `false`，因此会跳过 DMA 和缓冲区访问。交换中的 `Acquire` 与初始化时的 `Release` 配对。 [就绪检查](../kernel/src/console/panic_dma.rs)
+原子交换也处理了重入。例如格式化错误信息时再次 panic，第二次调用会看到 `false`，因此会跳过 DMA 和缓冲区访问。交换中的 `Acquire` 与初始化时的 `Release` 配对。 [就绪检查](../kernel/src/drivers/console/panic_dma.rs)
 
 ## 3. 准备 DMA 能读到的消息
 
-`PANIC_BUFFER` 是静态缓冲区，容纳最多 512 字节，并按 32 字节对齐。它属于 `.bss`，链接脚本把它放在从 `0x24000000` 开始的 AXI SRAM，DMA1 可以访问这里。 [缓冲区实现](../kernel/src/console/panic_dma.rs) · [内存布局](../kernel/memory.x) · [STM32H743 总线与内存映射](https://www.st.com/resource/en/reference_manual/rm0433-stm32h742-stm32h743-753-and-stm32h750-value-line-advanced-armbased-32bit-mcus-stmicroelectronics.pdf)
+`PANIC_BUFFER` 是静态缓冲区，容纳最多 512 字节，并按 32 字节对齐。它属于 `.bss`，链接脚本把它放在从 `0x24000000` 开始的 AXI SRAM，DMA1 可以访问这里。 [缓冲区实现](../kernel/src/drivers/console/panic_dma.rs) · [内存布局](../kernel/memory.x) · [STM32H743 总线与内存映射](https://www.st.com/resource/en/reference_manual/rm0433-stm32h742-stm32h743-753-and-stm32h750-value-line-advanced-armbased-32bit-mcus-stmicroelectronics.pdf)
 
 `buffer.write_fmt(args)` 会调用 `PanicBuffer::write_str()`，把 UTF-8 字节复制进缓冲区。空间不足时，代码按字符边界截断，保留已写入的部分。之后用 `as_ptr()` 取得地址，用 `buffer.len` 取得实际长度。长度为零时直接返回。
 
-如果 Cortex-M7 的 D-Cache 开着，刚格式化的字节可能还在 CPU 缓存中。代码调用 `SCB::clean_dcache_by_address(address, len)`，把覆盖缓冲区的脏缓存行写回内存。最后执行 `dsb()`，保证前面的内存操作完成，再打开 DMA。D-Cache 关闭时，代码仍执行这条屏障。 [缓存处理](../kernel/src/console/panic_dma.rs) · [ST AN4839 缓存维护说明](https://www.st.com/resource/en/application_note/an4839-level-1-cache-on-stm32f7-series-and-stm32h7-series-microcontrollers-stmicroelectronics.pdf)
+如果 Cortex-M7 的 D-Cache 开着，刚格式化的字节可能还在 CPU 缓存中。代码调用 `SCB::clean_dcache_by_address(address, len)`，把覆盖缓冲区的脏缓存行写回内存。最后执行 `dsb()`，保证前面的内存操作完成，再打开 DMA。D-Cache 关闭时，代码仍执行这条屏障。 [缓存处理](../kernel/src/drivers/console/panic_dma.rs) · [ST AN4839 缓存维护说明](https://www.st.com/resource/en/application_note/an4839-level-1-cache-on-stm32f7-series-and-stm32h7-series-microcontrollers-stmicroelectronics.pdf)
 
 ## 4. 配置寄存器并启动传输
 
-`USART1::ptr()`、`DMA1::ptr()` 和 `DMAMUX1::ptr()` 返回外设寄存器块的裸指针。panic handler 已经屏蔽普通中断并取得使用权，因此可以通过 PAC 直接访问这些寄存器，即使 HAL 的 `Tx<USART1>` 仍由驱动持有。 [寄存器配置](../kernel/src/console/panic_dma.rs)
+`USART1::ptr()`、`DMA1::ptr()` 和 `DMAMUX1::ptr()` 返回外设寄存器块的裸指针。panic handler 已经屏蔽普通中断并取得使用权，因此可以通过 PAC 直接访问这些寄存器，即使 HAL 的 `Tx<USART1>` 仍由驱动持有。 [寄存器配置](../kernel/src/drivers/console/panic_dma.rs)
 
 | 操作 | 写入内容 | 作用 |
 | --- | --- | --- |
@@ -84,7 +84,7 @@ stream.ndtr.write(|w| w.ndt().bits(len as u16));
 2. **关闭请求和 Stream。** 先保存关闭前的状态。完成条件为 `TCIF0` 置位、`NDTR` 为零且 `TEIF0`、`DMEIF0` 均未置位。软件关闭 Stream 也可能置位 `TCIF0`，因此要先判断，再清 `USART1.CR3.DMAT` 和 DMA Stream 0 的 `CR.EN`。
 3. **等串口发完。** 当 DMA 已将最后一个字节交给 USART1 时，继续轮询 `USART1.ISR.TC`，等待最后一帧发完。
 
-`wait_until()` 每次调用最多检查 1600 万次。这个上限按轮询次数计算，时间取决于 CPU 频率与构建配置。DMA 出错或超时时仍会执行关闭步骤，串口可能只收到部分消息。 [轮询和收尾代码](../kernel/src/console/panic_dma.rs) · [STM32H743 RM0433](https://www.st.com/resource/en/reference_manual/rm0433-stm32h742-stm32h743-753-and-stm32h750-value-line-advanced-armbased-32bit-mcus-stmicroelectronics.pdf)
+`wait_until()` 每次调用最多检查 1600 万次。这个上限按轮询次数计算，时间取决于 CPU 频率与构建配置。DMA 出错或超时时仍会执行关闭步骤，串口可能只收到部分消息。 [轮询和收尾代码](../kernel/src/drivers/console/panic_dma.rs) · [STM32H743 RM0433](https://www.st.com/resource/en/reference_manual/rm0433-stm32h742-stm32h743-753-and-stm32h750-value-line-advanced-armbased-32bit-mcus-stmicroelectronics.pdf)
 
 ## 6. 在板上观察
 

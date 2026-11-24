@@ -4,19 +4,25 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| [`kernel/src/main.rs`](../kernel/src/main.rs) | 定义 `#[entry]`，串联板级初始化、启动输出、PC13 电平切换、读取 JEDEC ID 和 panic 演示 |
-| [`kernel/src/board.rs`](../kernel/src/board.rs) | 取得 STM32 外设所有权，配置供电和时钟，初始化 GPIO、USART1、DMA1 和 QUADSPI |
-| [`kernel/src/qspi.rs`](../kernel/src/qspi.rs) | 封装 W25Q64JV 的 JEDEC ID 和按偏移读取操作 |
-| [`kernel/src/console.rs`](../kernel/src/console.rs) | 管理普通输出队列，通过 HAL 轮询发送，保存 DMA1 Stream 0 的所有权 |
-| [`kernel/src/console/panic_dma.rs`](../kernel/src/console/panic_dma.rs) | 在 panic 路径中格式化消息、维护 D-Cache 并直接操作 USART1 和 DMA 寄存器 |
+| [`kernel/src/main.rs`](../kernel/src/main.rs) | 定义 `#[entry]`，串联板级初始化、启动输出、批处理和结束后的 panic 演示 |
+| [`kernel/src/board.rs`](../kernel/src/board.rs) | 取得 STM32 外设所有权、配置时钟和引脚，构造板上实际使用的 Flash 和串口驱动 |
+| [`kernel/src/drivers.rs`](../kernel/src/drivers.rs) | 组织可供板级代码和内核逻辑使用的设备驱动 |
+| [`kernel/src/drivers/qspi.rs`](../kernel/src/drivers/qspi.rs) | 封装 W25Q64JV 的 JEDEC ID 和按偏移读取操作 |
+| [`kernel/src/drivers/console.rs`](../kernel/src/drivers/console.rs) | 管理普通输出队列，通过 HAL 轮询发送，保存 DMA1 Stream 0 的所有权 |
+| [`kernel/src/drivers/console/panic_dma.rs`](../kernel/src/drivers/console/panic_dma.rs) | 在 panic 路径中格式化消息、维护 D-Cache 并直接操作 USART1 和 DMA 寄存器 |
 | [`kernel/src/panic_handler.rs`](../kernel/src/panic_handler.rs) | 从 `PanicInfo` 提取消息与源码位置，调用 panic 输出后自旋 |
+| [`kernel/src/batch.rs`](../kernel/src/batch.rs) | 打开 KAPP 镜像，逐个装载、运行应用并报告退出码 |
+| [镜像解析](../kernel/src/batch/image.rs)与[段装载](../kernel/src/batch/loader.rs) | 检查 CRC 和应用地址范围，将段从 QSPI 复制到 AXI SRAM 并清零段尾 |
+| [`kernel/src/trap.rs`](../kernel/src/trap.rs) 与 [`svc.s`](../kernel/src/trap/svc.s) | Rust 构造初始异常帧，汇编处理 SVC、MSP/PSP 切换和退出码返回 |
 | [`memory.x`](../kernel/memory.x)、[`build.rs`](../kernel/build.rs) 和 [`.cargo/config.toml`](../.cargo/config.toml) | 定义内核的内存区域和链接参数，以及项目的交叉编译目标和烧录 runner |
 
 `main.rs` 使用 `#![no_std]` 和 `#![no_main]`。复位后，`cortex-m-rt` 提供的启动代码准备 RAM 中的静态数据，包括初始化 `.data` 和清零 `.bss`，随后调用 `#[entry]` 指定的 `main()`。
 
 `Board::init()` 使用 `pac::Peripherals::take()` 取得外设实例。它先配置 PWR 和 RCC，再初始化 PA9、PA10 和 PC13。PA9 和 PA10 使用 AF7，由 USART1 分别作为 TX 和 RX。PC13 配置为推挽输出。USART1 初始化后只保留发送句柄。DMA1 开启时钟后，Stream 0 随 `ConsoleDriver` 一起交给入口函数，控制台此时才允许 panic DMA 接管发送。
 
-入口函数把启动消息放入队列，把 PC13 拉低，调用 `wait_for_write()` 等待串口发完，再把 PC13 拉高。接着读取并打印 Flash 的 JEDEC ID，再次等串口发完后调用 `panic!("Done!")`。两次等待确保进入 panic DMA 路径前，普通串口消息已完整发送。
+入口函数把启动消息放入队列，把 PC13 拉低，调用 `wait_for_write()` 等待串口发完，再把 PC13 拉高。批处理从 `Board` 借用 Flash 和控制台，先校验镜像，再顺序装载和执行应用。加载或校验错误沿 `Result` 返回给入口，统一打印诊断。日志发送完毕后，入口保留 `panic!("Done!")` 的 DMA 演示。
+
+板级代码负责构造驱动，所以批处理接收的是已经初始化的 W25Q64JV 和控制台句柄。应用始终复用同一段 SRAM，`batch` 要等到 `trap::run_app()` 返回后才能装载下一个。 [应用切换和实板验证](svc-app-start-exit.md)
 
 ## 链接与内存
 
@@ -30,9 +36,13 @@ Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指
 
 panic 缓冲区位于 AXI SRAM 的 `.bss`。如果将来调整链接布局，需要继续把它放在 DMA1 可访问的内存，并保留 32 字节对齐。[DMA 缓冲区与缓存维护](dma-panic.md#3-准备-dma-能读到的消息)
 
-`cargo build --locked -p user_lib --bin 00hello` 生成应用 ELF。应用以 Rust 的 [`_start`](../user/src/runtime.rs) 为入口，调用 `main()`，再把返回值交给 `exit()`。`00hello` 发起一次写入请求后返回 `0`。后续由内核复制可加载段、清零零填充区域，并在进入应用前设置 PSP。
+`cargo build --locked -p user_lib --bin 00hello` 生成应用 ELF。内核装载可加载段并设置 PSP，应用从 Rust 的 [`_start`](../user/src/runtime.rs) 进入，调用 `main()`，再把返回值交给 `exit()`。`00hello` 在返回前会请求用户态写入，当前内核的 SVC 处理只支持进入和退出。
 
-用户库的 [`lib.rs`](../user/src/lib.rs) 提供应用使用的 `write` 和 `exit` 接口。[用户态控制台](../user/src/console.rs) 将格式化结果交给 `write`，[系统调用模块](../user/src/syscall.rs) 集中处理 SVC 编号和传参寄存器。应用编写和输出格式因此可以独立于底层调用约定。
+用户库的 [`lib.rs`](../user/src/lib.rs) 从运行时导出应用使用的 `write` 和 `exit` 接口。[用户态控制台](../user/src/console.rs) 将格式化结果交给 `write`，运行时内部的[系统调用模块](../user/src/runtime/syscall.rs) 处理 SVC 编号和传参寄存器。
+
+## 主机打包器
+
+[命令行模块](../tools/pack/src/cli.rs) 只解析参数，[生成流程](../tools/pack/src/pack.rs) 负责读取输入、检查文件冲突并写出完整镜像。[ELF 解析](../tools/pack/src/elf.rs) 和 [KAPP 编码](../tools/pack/src/image.rs) 分别处理两种文件格式。入口统一打印结果，因此可从参数、输入文件和镜像编码三个层次定位问题。
 
 ## 普通串口输出
 
@@ -46,9 +56,9 @@ panic 缓冲区位于 AXI SRAM 的 `.bss`。如果将来调整链接布局，需
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked -- -D warnings
+cargo fmt --manifest-path tools/pack/Cargo.toml -- --check
 cargo build --locked
 cargo build --release --locked
 ```
 
-这组命令覆盖格式、静态检查和两种构建配置的链接。板上验证以复位后的两段串口输出、PC13 电平顺序和 DMA 寄存器状态为准。[接线与预期输出](../README.md#查看串口输出) · [DMA 调试步骤](dma-panic.md#6-在板上观察)
+这组命令覆盖格式和两种构建配置的链接。板上可以分别观察应用退出码、PC13 电平顺序和随后 DMA 发送的 panic 文本。 [接线与预期输出](../README.md#查看串口输出) · [DMA 调试步骤](dma-panic.md#6-在板上观察)

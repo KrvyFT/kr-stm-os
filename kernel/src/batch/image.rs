@@ -2,7 +2,7 @@ use heapless::Vec;
 
 use crate::{
     batch::{APP_END, APP_START},
-    qspi::{FlashError, W25q64jv},
+    drivers::qspi::{FlashError, W25q64jv},
 };
 
 const HEADER_SIZE: u32 = 24;

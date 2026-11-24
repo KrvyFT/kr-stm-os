@@ -1,6 +1,6 @@
 use core::{hint::spin_loop, panic::PanicInfo};
 
-use crate::console;
+use crate::drivers::console;
 
 #[panic_handler]
 fn panic(info: &PanicInfo<'_>) -> ! {
