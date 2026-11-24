@@ -6,5 +6,6 @@
     "memory-view.trackDebuggers": [
         "probe-rs-debug"
     ],
-    "makefile.configureOnOpen": false
+    "makefile.configureOnOpen": false,
+    "commentTranslate.source": "renping.deepseek-comment-translate-deepseek"
 }

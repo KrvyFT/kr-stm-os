@@ -129,6 +129,7 @@ impl Image<'_> {
             }
         }
         image.payload_start = segment_cursor;
+        image.verify_crc()?;
 
         Ok(image)
     }

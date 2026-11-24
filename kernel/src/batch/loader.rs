@@ -11,12 +11,13 @@ pub struct LoadedApp {
 pub unsafe fn load(image: &mut Image<'_>, index: u32) -> Result<LoadedApp, ImageError> {
     let app = image.validate_app(index)?;
     let mut buf = [0u8; 128];
+
     for segment in app.segments() {
         let dst = segment.dst_addr as *mut u8;
         let mut copied = 0;
         while copied < segment.file_len {
             let len = (segment.file_len - copied).min(buf.len() as u32) as usize;
-            image.read_payload(segment.payload_offset, &mut buf)?;
+            image.read_payload(segment.payload_offset + copied, &mut buf[..len])?;
             unsafe {
                 ptr::copy_nonoverlapping(buf.as_ptr(), dst.add(copied as usize), len);
             }

@@ -10,7 +10,7 @@ use crate::{
 use image::Image;
 
 const APP_START: u32 = 0x2406_0000;
-const APP_END: u32 = 0x2407_f000; // 应用段的上界，接下来是用户栈。
+const APP_END: u32 = 0x2407_f000;
 const APP_STACK_TOP: u32 = 0x2408_0000;
 
 fn print_line(console: &mut ConsoleDriver, args: fmt::Arguments<'_>) {
