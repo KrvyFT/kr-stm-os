@@ -1,11 +1,12 @@
 use core::{
     arch::global_asm,
-    slice,
+    ptr, slice,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use cortex_m::{
     asm,
     peripheral::{MPU, SCB},
+    register::psp,
 };
 
 use crate::{
@@ -13,24 +14,23 @@ use crate::{
     drivers::console::{self, MAX_MESSAGE_BYTES, WriteError},
 };
 
+const THREAD_MSP_BASIC: u32 = 0xffff_fff9;
+const THREAD_PSP_BASIC: u32 = 0xffff_fffd;
+const SVC_EXCEPTION: u32 = 11;
+const SVC_EXIT: u16 = 0xdf01;
+const SVC_WRITE: u16 = 0xdf02;
+// The assembly save area holds r3-r11 and EXC_RETURN.
+const KERNEL_SAVE_BYTES: usize = 10 * size_of::<u32>();
+
 static APP_ACTIVE: AtomicBool = AtomicBool::new(false);
 static FAULT_PC: AtomicU32 = AtomicU32::new(0);
 static FAULT_CFSR: AtomicU32 = AtomicU32::new(0);
-
-type AppFaultHook = extern "C" fn(u32, u32, u32) -> u32;
-
-unsafe extern "C" {
-    static mut __kr_app_fault_hook: Option<AppFaultHook>;
-}
 
 pub(crate) fn init_app_faults() {
     const MEMFAULTENA: u32 = 1 << 16;
     const USGFAULTENA: u32 = 1 << 18;
 
-    // Install the handler before a configurable fault can reach it.
     unsafe {
-        __kr_app_fault_hook = Some(handle_app_fault);
-        asm::dsb();
         (*SCB::PTR)
             .shcsr
             .modify(|value| value | MEMFAULTENA | USGFAULTENA);
@@ -72,19 +72,11 @@ fn init_app_mpu() {
     asm::isb();
 }
 
-extern "C" fn handle_app_fault(psp: u32, exc_return: u32, exception: u32) -> u32 {
+// The caller must validate the basic PSP frame before invoking this handler.
+unsafe fn handle_app_fault(frame: *const BasicExceptionFrame, exception: u32) -> bool {
     const UNDEFINSTR: u32 = 1 << 16;
     const DACCVIOL: u32 = 1 << 1;
     const MMARVALID: u32 = 1 << 7;
-
-    let last_frame_start = APP_STACK_TOP - size_of::<BasicExceptionFrame>() as u32;
-    if !APP_ACTIVE.load(Ordering::Acquire)
-        || exc_return != 0xffff_fffd
-        || psp & 7 != 0
-        || !(APP_END..=last_frame_start).contains(&psp)
-    {
-        return 0;
-    }
 
     let scb = unsafe { &*SCB::PTR };
     let cfsr = scb.cfsr.read();
@@ -94,18 +86,17 @@ extern "C" fn handle_app_fault(psp: u32, exc_return: u32, exception: u32) -> u32
         _ => false,
     };
     if !recoverable {
-        return 0;
+        return false;
     }
 
-    let frame = psp as *const BasicExceptionFrame;
-    let pc = unsafe { core::ptr::addr_of!((*frame).pc).read_volatile() };
+    let pc = unsafe { ptr::addr_of!((*frame).pc).read_volatile() };
     FAULT_PC.store(pc, Ordering::Relaxed);
     FAULT_CFSR.store(cfsr, Ordering::Release);
 
     // CFSR is write-one-to-clear. Do not leave these flags for the next app.
     unsafe { scb.cfsr.write(cfsr) };
     asm::dsb();
-    1
+    true
 }
 
 pub(crate) fn take_app_fault() -> Option<(u32, u32)> {
@@ -125,8 +116,103 @@ struct BasicExceptionFrame {
     xpsr: u32,
 }
 
+#[repr(u32)]
+enum ExceptionAction {
+    ResumeApp,
+    StartApp,
+    FinishApp,
+    DefaultHandler,
+}
+
 unsafe extern "C" {
     fn __kr_run_app(frame: *mut BasicExceptionFrame) -> i32;
+    static __kr_resume_kernel: u8;
+    fn DefaultHandler();
+}
+
+global_asm!(
+    include_str!("trap/svc.s"),
+    dispatch = sym dispatch_exception,
+    resume = const ExceptionAction::ResumeApp as u32,
+    start = const ExceptionAction::StartApp as u32,
+    finish = const ExceptionAction::FinishApp as u32,
+    psp_basic_inverted = const !THREAD_PSP_BASIC,
+    default_handler = sym DefaultHandler,
+);
+
+fn app_frame(stack_floor: u32) -> Option<*mut BasicExceptionFrame> {
+    let address = psp::read();
+    let last_frame_start = APP_STACK_TOP - size_of::<BasicExceptionFrame>() as u32;
+    (address & 7 == 0 && (stack_floor..=last_frame_start).contains(&address))
+        .then_some(address as *mut BasicExceptionFrame)
+}
+
+// Called only from the exception entry with MSP captured before its temporary push.
+unsafe extern "C" fn dispatch_exception(
+    msp: *mut u8,
+    exc_return: u32,
+    exception: u32,
+) -> ExceptionAction {
+    let app_active = APP_ACTIVE.load(Ordering::Acquire);
+    if exception == SVC_EXCEPTION {
+        if app_active && exc_return == THREAD_MSP_BASIC {
+            let frame = msp.cast::<BasicExceptionFrame>();
+            let pc = unsafe { ptr::addr_of!((*frame).pc).read_volatile() };
+            if pc == (&raw const __kr_resume_kernel) as u32 {
+                let initial_psp = unsafe { ptr::addr_of!((*frame).r0).read_volatile() };
+                // Handler mode is still using MSP, so PSP can be prepared in Rust.
+                unsafe { psp::write(initial_psp) };
+                return ExceptionAction::StartApp;
+            }
+        }
+
+        if app_active
+            && exc_return == THREAD_PSP_BASIC
+            && let Some(frame) = app_frame(APP_START)
+        {
+            return unsafe { dispatch_app_svc(msp, frame) };
+        }
+        asm::udf();
+    }
+
+    if app_active
+        && exc_return == THREAD_PSP_BASIC
+        && let Some(frame) = app_frame(APP_END)
+        && unsafe { handle_app_fault(frame, exception) }
+    {
+        return unsafe { finish_app(msp, 0) };
+    }
+    ExceptionAction::DefaultHandler
+}
+
+unsafe fn dispatch_app_svc(msp: *mut u8, frame: *mut BasicExceptionFrame) -> ExceptionAction {
+    // The hardware-stacked PC points after the 16-bit Thumb SVC instruction.
+    let pc = unsafe { ptr::addr_of!((*frame).pc).read_volatile() };
+    if pc & 1 != 0 || !(APP_START + 2..=APP_STACK_TOP).contains(&pc) {
+        asm::udf();
+    }
+    let instruction = unsafe { ((pc - 2) as *const u16).read_volatile() };
+    let arg0 = unsafe { ptr::addr_of!((*frame).r0).read_volatile() };
+    match instruction {
+        SVC_EXIT => unsafe { finish_app(msp, arg0) },
+        SVC_WRITE => {
+            let len = unsafe { ptr::addr_of!((*frame).r1).read_volatile() };
+            let result = sys_write(arg0, len);
+            unsafe { ptr::addr_of_mut!((*frame).r0).write_volatile(result as u32) };
+            ExceptionAction::ResumeApp
+        }
+        _ => asm::udf(),
+    }
+}
+
+unsafe fn finish_app(msp: *mut u8, code: u32) -> ExceptionAction {
+    // The suspended kernel's hardware frame follows the entry's software save area.
+    // Write r0 there so hardware unstacking delivers the code to __kr_run_app.
+    let kernel_frame = msp
+        .wrapping_add(KERNEL_SAVE_BYTES)
+        .cast::<BasicExceptionFrame>();
+    unsafe { ptr::addr_of_mut!((*kernel_frame).r0).write_volatile(code) };
+    ExceptionAction::FinishApp
 }
 
 /// # Safety
@@ -157,8 +243,7 @@ pub(crate) unsafe fn run_app(entry: u32, stack_top: u32) -> i32 {
     }
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn __kr_sys_write(addr: u32, len: u32) -> i32 {
+fn sys_write(addr: u32, len: u32) -> i32 {
     const EAGAIN: i32 = -11;
     const EFAULT: i32 = -14;
     const EMSGSIZE: i32 = -90;
@@ -182,5 +267,3 @@ extern "C" fn __kr_sys_write(addr: u32, len: u32) -> i32 {
         Err(WriteError::Full) => EAGAIN,
     }
 }
-
-global_asm!(include_str!("trap/svc.s"), options(raw));

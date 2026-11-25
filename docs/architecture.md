@@ -13,7 +13,7 @@
 | [`kernel/src/panic_handler.rs`](../kernel/src/panic_handler.rs) | 从 `PanicInfo` 提取消息与源码位置，调用 panic 输出后自旋 |
 | [`kernel/src/batch.rs`](../kernel/src/batch.rs) | 打开 KAPP 镜像，逐个装载、运行应用并报告退出码 |
 | [镜像解析](../kernel/src/batch/image.rs)与[段装载](../kernel/src/batch/loader.rs) | 检查 CRC 和应用地址范围，将段从 QSPI 复制到 AXI SRAM 并清零段尾 |
-| [`kernel/src/trap.rs`](../kernel/src/trap.rs) 与 [`svc.s`](../kernel/src/trap/svc.s) | Rust 构造初始异常帧，汇编处理 SVC、MSP/PSP 切换和退出码返回 |
+| [`kernel/src/trap.rs`](../kernel/src/trap.rs) 与 [`svc.s`](../kernel/src/trap/svc.s) | Rust 构造和读写异常帧，分派 SVC 与 Fault。汇编保存和恢复上下文 |
 | [`memory.x`](../kernel/memory.x)、[`build.rs`](../kernel/build.rs) 和 [`.cargo/config.toml`](../.cargo/config.toml) | 定义内核的内存区域和链接参数，以及项目的交叉编译目标和烧录 runner |
 
 `main.rs` 使用 `#![no_std]` 和 `#![no_main]`。复位后，`cortex-m-rt` 提供的启动代码准备 RAM 中的静态数据，包括初始化 `.data` 和清零 `.bss`，随后调用 `#[entry]` 指定的 `main()`。

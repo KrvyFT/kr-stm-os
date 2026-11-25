@@ -7,9 +7,11 @@
 .type __kr_run_app,%function
 .thumb_func
 __kr_run_app:
+    @ The C ABI carries the initial PSP and final exit code in r0.
     dsb
     svc     #0
-.Lresume_kernel:
+.global __kr_resume_kernel
+__kr_resume_kernel:
     bx      lr
 .size __kr_run_app, . - __kr_run_app
 
@@ -18,126 +20,53 @@ __kr_run_app:
 .type SVCall,%function
 .thumb_func
 SVCall:
-    mvn.w   r1, #6
-    cmp     lr, r1
-    beq     .Lstart_app
+    @ Capture MSP before pushing. BL overwrites the EXC_RETURN in LR.
+    mrs     r0, MSP
+    mov     r1, lr
+    mrs     r2, IPSR
+    push    {{r3, lr}}
+    bl      {dispatch}
+    ldmia   sp!, {{r3, lr}}
 
-    mvn.w   r1, #2
-    cmp     lr, r1
-    beq     .Luser_svc
-    b       .Lunsupported_svc
+    cmp     r0, #{resume}
+    beq     .Lexception_return
+    cmp     r0, #{start}
+    beq     .Lstart_app
+    cmp     r0, #{finish}
+    beq     .Lfinish_app
+    b       {default_handler}
 
 .Lstart_app:
-    ldr     r2, [sp, #24]
-    adr.w   r1, .Lresume_kernel
-    cmp     r2, r1
-    bne     .Lunsupported_svc
-
-    ldr     r0, [sp]
-    stmdb   sp!, {r3-r11, lr}
-    msr     PSP, r0
-
-    movs    r1, #0
-    mov     r4, r1
-    mov     r5, r1
-    mov     r6, r1
-    mov     r7, r1
-    mov     r8, r1
-    mov     r9, r1
-    mov     r10, r1
-    mov     r11, r1
-
-    movs    r1, #1
-    msr     CONTROL, r1
+    @ Save r4-r11, which the basic hardware frame leaves live. r3 pads
+    @ the software save area to 40 bytes and keeps MSP 8-byte aligned.
+    stmdb   sp!, {{r3-r11, lr}}
+    movs    r0, #0
+    mov     r4, r0
+    mov     r5, r0
+    mov     r6, r0
+    mov     r7, r0
+    mov     r8, r0
+    mov     r9, r0
+    mov     r10, r0
+    mov     r11, r0
+    movs    r0, #1
+    msr     CONTROL, r0
     isb
-    mvn.w   lr, #2
+    mvn.w   lr, #{psp_basic_inverted}
     bx      lr
-
-.Luser_svc:
-    mrs     r0, PSP
-    ldr     r2, [r0, #24]
-    subs    r2, #2
-    ldrh    r2, [r2]
-    movw    r1, #0xdf01
-    cmp     r2, r1
-    beq     .Lexit_app
-    movw    r1, #0xdf02
-    cmp     r2, r1
-    beq     .Lwrite_app
-    b       .Lunsupported_svc
-
-.Lexit_app:
-    ldr     r0, [r0]
 
 .Lfinish_app:
-    @ MSP points to the suspended kernel context. r0 is the run_app result.
-    ldmia   sp!, {r3-r11, lr}
-    str     r0, [sp]
-
-    movs    r1, #0
-    msr     CONTROL, r1
+    @ The Rust dispatcher has already set r0 in the kernel hardware frame.
+    ldmia   sp!, {{r3-r11, lr}}
+    movs    r0, #0
+    msr     CONTROL, r0
     isb
+.Lexception_return:
     bx      lr
-
-.Lwrite_app:
-    push    {r4, lr}
-    mov     r4, r0
-    ldr     r0, [r4]
-    ldr     r1, [r4, #4]
-    bl      __kr_sys_write
-    str     r0, [r4]
-    ldmia   sp!, {r4, lr}
-    bx      lr
-
-.Lunsupported_svc:
-    udf     #0
 .size SVCall, . - SVCall
 
-.p2align 2
+@ All three vectors enter the same code. IPSR distinguishes their causes.
 .global UsageFault
-.type UsageFault,%function
-.thumb_func
-UsageFault:
-    b       .Lapp_fault
-.size UsageFault, . - UsageFault
-
-.p2align 2
+.thumb_set UsageFault, SVCall
 .global MemoryManagement
-.type MemoryManagement,%function
-.thumb_func
-MemoryManagement:
-    b       .Lapp_fault
-.size MemoryManagement, . - MemoryManagement
-
-.Lapp_fault:
-    @ Only Thread mode with a basic PSP frame can use the app exit path.
-    mvn.w   r1, #2
-    cmp     lr, r1
-    bne     .Lfatal_fault
-
-    @ Rust installs this callback before enabling the configurable faults.
-    ldr     r3, =__kr_app_fault_hook
-    ldr     r3, [r3]
-    cbz     r3, .Lfatal_fault
-    mrs     r0, PSP
-    mrs     r2, IPSR
-    push    {r4, lr}
-    blx     r3
-    ldmia   sp!, {r4, lr}
-
-    cbz     r0, .Lfatal_fault
-    movs    r0, #0
-    b       .Lfinish_app
-
-.Lfatal_fault:
-    b       DefaultHandler
-
-.ltorg
-
-.section .bss.app_fault_hook,"aw",%nobits
-.p2align 2
-.global __kr_app_fault_hook
-.type __kr_app_fault_hook,%object
-__kr_app_fault_hook:
-    .zero 4
-.size __kr_app_fault_hook, . - __kr_app_fault_hook
+.thumb_set MemoryManagement, SVCall

@@ -20,7 +20,7 @@ MSP 是内核和异常处理程序用的栈，PSP 是应用 Thread 用的栈。*
 
 ## 2. 编写 Rust 入口和初始异常帧
 
-在 `kernel/src/trap.rs` 写入以下完整内容。
+以下是内核构造应用初始帧的代码。 [异常处理源码](../kernel/src/trap.rs)
 
 ```rust
 #[repr(C)]
@@ -33,10 +33,6 @@ struct BasicExceptionFrame {
     lr: u32,
     pc: u32,
     xpsr: u32,
-}
-
-unsafe extern "C" {
-    fn __kr_run_app(frame: *mut BasicExceptionFrame) -> i32;
 }
 
 /// # Safety
@@ -68,193 +64,38 @@ pub(crate) unsafe fn run_app(entry: u32, stack_top: u32) -> i32 {
 }
 ```
 
-- `#[repr(C)]` 固定字段顺序。基本异常帧是八个 32 位字，硬件按这个顺序恢复寄存器。`pc` 位于帧起点 `+0x18`，`xpsr` 位于 `+0x1c`，后面的汇编也用这些偏移取值。
+- `#[repr(C)]` 固定字段顺序。基本异常帧是八个 32 位字，硬件按这个顺序恢复寄存器。`pc` 位于帧起点 `+0x18`，`xpsr` 位于 `+0x1c`，Rust 通过结构字段访问这两个位置。
 - 当前 `stack_top` 是 `0x2408_0000`。栈向低地址增长，所以初始帧写在 `0x2407_ffe0`，满足 8 字节对齐。异常返回弹出 32 字节之后，应用的 PSP 回到 `0x2408_0000`。
 - 打包器记录的 Thumb 入口示例是 `0x2406_0001`。`entry & !1` 得到帧中所需的指令地址 `0x2406_0000`，把 `xPSR.T` 设为 1 来指定 Thumb 状态。
 - 写入的初始 `lr` 是 0。`_start()` 调用 `main()` 时会建立函数返回地址。等 `main()` 返回后，`_start()` 通过退出系统调用结束应用。
 - `__kr_run_app(frame)` 按 C ABI 把帧指针放进 `r0`，并从 `r0` 取回 `i32` 返回值。这个调用跨越汇编边界。`run_app()` 的调用方必须兑现注释里的安全前提。
-- `global_asm!` 通过 `include_str!` 读取相对 `trap.rs` 的汇编文件。`options(raw)` 让寄存器列表里的花括号原样传给汇编器。这个接法由 Rust 编译目标决定指令集，通过现有的 Cargo 构建即可。
 
 对应的内存划分见 [内核链接脚本](../kernel/memory.x) 和 [应用链接脚本](../user/link.x)。
 
-## 3. 接入独立汇编文件
+## 3. 异常入口与 Rust 分发
 
-`kernel/src/trap/svc.s` 已有对应实现时，直接核对下面的两个全局符号和两条分支。如果从其他分支开始，按这个路径创建文件并写入完整内容。
-
-```asm
-.syntax unified
-.thumb
-.section .text.batch_trap,"ax",%progbits
-
-.p2align 2
-.global __kr_run_app
-.type __kr_run_app,%function
-.thumb_func
-__kr_run_app:
-    dsb
-    svc     #0
-.Lresume_kernel:
-    bx      lr
-.size __kr_run_app, . - __kr_run_app
-
-.p2align 2
-.global SVCall
-.type SVCall,%function
-.thumb_func
-SVCall:
-    mvn.w   r1, #6
-    cmp     lr, r1
-    beq     .Lstart_app
-
-    mvn.w   r1, #2
-    cmp     lr, r1
-    beq     .Luser_svc
-    b       .Lunsupported_svc
-
-.Lstart_app:
-    ldr     r2, [sp, #24]
-    adr.w   r1, .Lresume_kernel
-    cmp     r2, r1
-    bne     .Lunsupported_svc
-
-    ldr     r0, [sp]
-    stmdb   sp!, {r3-r11, lr}
-    msr     PSP, r0
-
-    movs    r1, #0
-    mov     r4, r1
-    mov     r5, r1
-    mov     r6, r1
-    mov     r7, r1
-    mov     r8, r1
-    mov     r9, r1
-    mov     r10, r1
-    mov     r11, r1
-
-    movs    r1, #1
-    msr     CONTROL, r1
-    isb
-    mvn.w   lr, #2
-    bx      lr
-
-.Luser_svc:
-    mrs     r0, PSP
-    ldr     r2, [r0, #24]
-    subs    r2, #2
-    ldrh    r2, [r2]
-    movw    r1, #0xdf01
-    cmp     r2, r1
-    beq     .Lexit_app
-    movw    r1, #0xdf02
-    cmp     r2, r1
-    beq     .Lwrite_app
-    b       .Lunsupported_svc
-
-.Lexit_app:
-    ldr     r0, [r0]
-
-.Lfinish_app:
-    @ MSP points to the suspended kernel context. r0 is the run_app result.
-    ldmia   sp!, {r3-r11, lr}
-    str     r0, [sp]
-
-    movs    r1, #0
-    msr     CONTROL, r1
-    isb
-    bx      lr
-
-.Lwrite_app:
-    push    {r4, lr}
-    mov     r4, r0
-    ldr     r0, [r4]
-    ldr     r1, [r4, #4]
-    bl      __kr_sys_write
-    str     r0, [r4]
-    ldmia   sp!, {r4, lr}
-    bx      lr
-
-.Lunsupported_svc:
-    udf     #0
-.size SVCall, . - SVCall
-
-.p2align 2
-.global UsageFault
-.type UsageFault,%function
-.thumb_func
-UsageFault:
-    b       .Lapp_fault
-.size UsageFault, . - UsageFault
-
-.p2align 2
-.global MemoryManagement
-.type MemoryManagement,%function
-.thumb_func
-MemoryManagement:
-    b       .Lapp_fault
-.size MemoryManagement, . - MemoryManagement
-
-.Lapp_fault:
-    @ Only Thread mode with a basic PSP frame can use the app exit path.
-    mvn.w   r1, #2
-    cmp     lr, r1
-    bne     .Lfatal_fault
-
-    @ Rust installs this callback before enabling the configurable faults.
-    ldr     r3, =__kr_app_fault_hook
-    ldr     r3, [r3]
-    cbz     r3, .Lfatal_fault
-    mrs     r0, PSP
-    mrs     r2, IPSR
-    push    {r4, lr}
-    blx     r3
-    ldmia   sp!, {r4, lr}
-
-    cbz     r0, .Lfatal_fault
-    movs    r0, #0
-    b       .Lfinish_app
-
-.Lfatal_fault:
-    b       DefaultHandler
-
-.ltorg
-
-.section .bss.app_fault_hook,"aw",%nobits
-.p2align 2
-.global __kr_app_fault_hook
-.type __kr_app_fault_hook,%object
-__kr_app_fault_hook:
-    .zero 4
-.size __kr_app_fault_hook, . - __kr_app_fault_hook
-```
+`SVCall`、`UsageFault` 和 `MemoryManagement` 共用一段汇编入口。Rust 用 `global_asm!` 和 `include_str!` 引入 `svc.s`，并传入分发函数符号和动作常量。入口在压栈前读取 MSP，用 `{r3, lr}` 暂存 `EXC_RETURN` 并保持 MSP 的八字节对齐，再把原 MSP、`EXC_RETURN` 和 IPSR 传给 Rust。直接从汇编进入确保这些操作发生在 Rust 函数建立自己的栈帧之前。 [汇编入口](../kernel/src/trap/svc.s) · [Rust 分发](../kernel/src/trap.rs)
 
 ### 3.1 内核进入 `svc #0`
 
-1. `dsb` 等待前面写入应用数据和初始帧的内存访问完成。`svc #0` 进入 handler，硬件在 MSP 上保存内核帧，帧里的 PC 已经指向 `.Lresume_kernel`。
-2. `mvn.w r1, #6` 生成 `0xffff_fff9`。handler 用这个值比对当前 LR，确认此次异常来自使用 MSP 的 Thread mode，且硬件保存的是基本帧。再用 `[sp, #24]` 比较压栈 PC 和 `.Lresume_kernel`，只让这个启动入口走切换分支。
-3. `ldr r0, [sp]` 取回启动前传入的应用帧指针。`stmdb sp!, {r3-r11, lr}` 在内核硬件帧下方额外保存 40 字节。其中 `r4–r11` 是硬件帧没有保存的寄存器，`lr` 是内核的 `EXC_RETURN`，额外压入 `r3` 使这块保存区大小为 8 的倍数。
-4. `msr PSP, r0` 把 PSP 指向应用帧。把 `r4–r11` 清零，使应用从确定的值开始。`msr CONTROL, r1` 把 `nPRIV` 置 1，`isb` 让后续指令使用更新后的执行上下文。
-5. `mvn.w lr, #2` 生成 `0xffff_fffd`。在 Handler mode 执行 `bx lr` 时，CPU 识别这个 `EXC_RETURN`，从 PSP 弹出应用基本帧并进入 Thread mode。内核帧留在 MSP 上，等待应用退出。
+1. `__kr_run_app` 执行 `dsb` 和 `svc #0`。硬件在 MSP 保存内核帧，帧里的 PC 指向紧随 SVC 的 `__kr_resume_kernel`。
+2. Rust 确认 `EXC_RETURN = 0xffff_fff9` 且内核帧的 PC 等于该标签的地址，再用帧内 `r0` 设置初始 PSP。Handler 仍在 MSP 上运行。
+3. 汇编从 Rust 返回后，用 `stmdb sp!, {r3-r11, lr}` 保存 40 字节的内核软件区。额外保存 `r3` 使栈保持对齐。寄存器 `r4–r11` 要留给以后恢复内核，并在进入应用前清零。
+4. 设置 `CONTROL.nPRIV` 后执行 `isb`，用 `0xffff_fffd` 执行异常返回。CPU 从 PSP 弹出初始帧，开始执行非特权应用。
 
 ### 3.2 应用通过 `svc #1` 退出
 
-1. 应用从 `_start()` 调用 `main()`，把返回值传给 `exit()`。`sys_exit()` 把退出码放入 `r0` 后执行 `svc #1`。硬件把应用现场压入 PSP，handler 进门时的 LR 是 `0xffff_fffd`。 [用户态入口](../user/src/runtime.rs) · [系统调用](../user/src/runtime/syscall.rs)
-2. `mrs r0, PSP` 得到应用帧地址。帧里的 PC 指向 SVC 的下一条指令，两字节之前是本次 Thumb SVC。`0xdf01` 是 `svc #1` 的指令编码，用来确认这是退出请求。
-3. `ldr r0, [r0]` 从应用帧取出退出码，`ldmia sp!, {r3-r11, lr}` 恢复内核的软件保存区。此时 MSP 再次指向内核硬件帧，`str r0, [sp]` 把退出码写入内核帧的 `r0` 槽。
-4. `CONTROL.nPRIV` 清零，`bx lr` 按保存下来的内核 `EXC_RETURN` 返回。CPU 从 MSP 弹出内核帧，在 `.Lresume_kernel` 继续，此时 `r0 = 42`。这里的第二个 `bx lr` 使用从硬件帧恢复的普通函数返回地址，因此回到 Rust。
-
-注意区分两份 LR。**异常帧里的 LR 是被打断代码的函数返回地址，handler 一进门的 LR 是 `EXC_RETURN`。** 恢复到内核时先用后者完成异常返回，再用前者完成 `__kr_run_app()` 的函数返回。用同一条汇编路径控制 MSP，可以让它在恢复时精确指回原硬件帧。
-
-`SVCall` 是向量表使用的符号名。`.global SVCall` 导出它供链接器解析，`.thumb_func` 标记 Thumb 函数入口。未匹配的 SVC 和扩展浮点帧会走 `udf #0`，以 Fault 暴露当前不支持的路径。项目编译目标使用 `eabihf`，这里要根据运行时的 `EXC_RETURN` 判断帧类型。
+1. `sys_exit()` 把退出码放入 `r0` 后执行 `svc #1`。硬件把应用现场压入 PSP，Handler 入门 LR 为 `0xffff_fffd`。 [用户态入口](../user/src/runtime.rs) · [系统调用](../user/src/runtime/syscall.rs)
+2. Rust 校验 PSP 帧和读取地址，从 `frame.pc - 2` 读取 Thumb 半字。编码 `0xdf01` 表示退出，`frame.r0` 是退出码。
+3. 当前 MSP 指向内核软件保存区。Rust 将退出码写入 `MSP + 40` 处的内核帧首字，随后汇编恢复软件区和特权级。
+4. 汇编用内核的 `EXC_RETURN` 执行 `bx lr`。CPU 从 MSP 恢复硬件帧，在 `__kr_resume_kernel` 继续，此时 `r0 = 42`。恢复点的第二个 `bx lr` 使用硬件弹出的普通 LR，回到调用 `__kr_run_app()` 的 Rust 函数。
 
 ### 3.3 应用通过 `svc #2` 写入并继续运行
 
-应用执行 `svc #2` 后，`.Luser_svc` 读出 `0xdf02`，转到 `.Lwrite_app`。此时活 `r0` 指向应用基本帧。`push {r4, lr}` 把应用的 `r4` 和本次 `EXC_RETURN` 保存到 MSP，正好占 8 字节。把帧地址暂存到 `r4`，是因为 C ABI 要求被调用者保留它，而 `r0` 和 `r1` 要用来传入应用帧中的缓冲区地址和长度。`bl` 会覆盖 LR，所以调用前必须保留异常返回令牌。
-
-Rust 返回后，`str r0, [r4]` 把结果写回 **PSP 上的应用帧**。汇编只弹出写入分支自己压入的两个字，再按原令牌异常返回，应用从 SVC 的下一条指令继续。内核等待退出的现场仍保留在 MSP 上。
+Rust 解码出 `0xdf02` 后，从 PSP 帧取缓冲区地址和长度，调用 `sys_write`，再把结果写回同一帧的 `r0`。汇编恢复进入 SVC 时的 `EXC_RETURN`，应用在原来的 PSP 上从 SVC 下一条指令继续。MSP 上暂停的内核现场保留到应用退出。未知 SVC 和扩展浮点帧会进入不支持的异常路径。
 
 ```rust
-#[unsafe(no_mangle)]
-extern "C" fn __kr_sys_write(addr: u32, len: u32) -> i32 {
+fn sys_write(addr: u32, len: u32) -> i32 {
     const EAGAIN: i32 = -11;
     const EFAULT: i32 = -14;
     const EMSGSIZE: i32 = -90;
@@ -407,12 +248,12 @@ Batch complete
 | 检查点 | 应看到的值 | 这个检查能定位什么 |
 | --- | --- | --- |
 | 第一次进入 `SVCall` | `LR = 0xfffffff9`。`MSP + 0x18` 处保存内核 `svc #0` 的下一条指令地址 | 确认向量正确，内核从预期的 MSP 路径进来 |
-| 启动分支的 `bx lr` 之前 | `LR = 0xfffffffd`，`PSP = 0x2407ffe0`。初始帧的 PC 为 `0x24060000`，xPSR 的 Thumb 位为 1 | 确认第一份应用帧符合异常返回要求 |
+| 以 `0xffff_fffd` 返回的 `bx lr` 之前 | `LR = 0xfffffffd`，`PSP = 0x2407ffe0`。初始帧的 PC 为 `0x24060000`，xPSR 的 Thumb 位为 1 | 确认第一份应用帧符合异常返回要求 |
 | 应用入口 `0x24060000` | `PSP = 0x24080000`，`CONTROL` 低两位为 `0b11` | 确认 CPU 真的开始执行应用，且线程使用非特权 PSP |
 | 第二次进入 `SVCall` | `LR = 0xfffffffd`。读 `[PSP]` 得到 `42`，`[PSP + 0x18] - 2` 处的半字是 `0xdf01` | 确认退出码进入应用帧，且调用号正确 |
 | 内核 `svc #0` 后一条指令 | `r0 = 42`，Thread mode 使用 MSP，`CONTROL.nPRIV = 0` | 确认恢复的是内核现场，退出码到达了返回寄存器 |
 
-GDB 中用 `disassemble __kr_run_app` 找到 `svc #0` 后面那条 `bx lr` 的地址。在那里设断点，可观察内核刚从退出异常返回的状态。查看基本帧时，`x/8wx $msp` 或 `x/8wx $psp` 的第一个字是 `r0`，第七个是 PC，第八个是 xPSR。对 MSP 的这条检查要在首次进 handler 且还未执行 `stmdb` 时做。
+GDB 中用 `disassemble __kr_run_app` 找到 `svc #0` 后面那条 `bx lr` 的地址。在那里设断点，可观察内核刚从退出异常返回的状态。查看基本帧时，`x/8wx $msp` 或 `x/8wx $psp` 的第一个字是 `r0`，第七个是 PC，第八个是 xPSR。对 MSP 的这条检查要在首次进 handler 且还未执行临时的 `push` 时做。
 
 如果需要确认装载内容，可先停在 `__kr_run_app`。此时应用已装好，但尚未执行。用 `x/8hx 0x24060000` 查看 SRAM 入口的指令半字，再运行 `llvm-objdump -d target/thumbv7em-none-eabihf/debug/00exit42`，和 ELF 中的 `_start` 指令对照。
 
@@ -420,7 +261,7 @@ GDB 中用 `disassemble __kr_run_app` 找到 `svc #0` 后面那条 `bx lr` 的�
 | --- | --- |
 | 打印 `KAPP error: BadCrc` | 确认烧入的是本轮 `apps-exit42.img`。需要时用 Makefile 的 `qspi-read` 读回相同长度，然后用 `cmp` 比较 |
 | 启动 SVC 没有命中 `SVCall` | 查看内核 ELF 中的 `SVCall` 和向量表第 11 项。确认运行的是刚构建的内核，且 SVC 没被屏蔽 |
-| 进入 `.Lunsupported_svc` | 查看 LR 和堆栈里的 PC。基本 PSP 帧下读 `PC - 2`，检查是否为未知 SVC 编号。若 LR 指示扩展帧，检查内核和应用是否执行了浮点路径 |
+| SVC 分发执行 `udf` | 查看 LR 和堆栈里的 PC。基本 PSP 帧下读 `PC - 2`，检查是否为未知 SVC 编号。若 LR 指示扩展帧，检查内核和应用是否执行了浮点路径 |
 | 已到启动分支，首次 `bx lr` 就触发 Fault | 核对 PSP 对齐、初始 PC、`xPSR.T` 和 `EXC_RETURN`。可在 Fault 处读 `CFSR`（`0xe000ed28`）与 `HFSR`（`0xe000ed2c`） |
 | 能进应用，但退出后挂住 | 检查退出分支有没有把 `42` 写回内核帧的 `r0`，以及 `ldmia` 后 MSP 是否正好回到内核硬件帧 |
 
