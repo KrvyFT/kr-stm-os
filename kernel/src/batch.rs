@@ -59,13 +59,26 @@ pub(crate) unsafe fn run(
             let app = loader::load(&mut image, index)?;
             trap::run_app(app.entry, app.stack_top)
         };
-        console.wait_for_write();
-        if let Some((pc, cfsr)) = trap::take_app_fault() {
-            console.print_fmt(format_args!(
-                "app[{index}] faulted: pc={pc:#010x} cfsr={cfsr:#010x}\r\n"
-            ));
-        } else {
-            console.print_fmt(format_args!("app[{index}] exited: {code}\r\n"));
+        match trap::take_app_fault() {
+            Some((pc, cfsr)) => {
+                const DACCVIOL: u32 = 1 << 1;
+                const MMARVALID: u32 = 1 << 7;
+                const UNDEFINSTR: u32 = 1 << 16;
+
+                // MMARVALID 只表示故障地址有效，去掉它再匹配故障原因。
+                let reason = match cfsr & !MMARVALID {
+                    DACCVIOL => "MPU denied data access",
+                    UNDEFINSTR => "undefined instruction",
+                    _ => "unknown fault",
+                };
+
+                console.print_fmt(format_args!(
+                    "app[{index}] faulted: {reason} (pc={pc:#010x})\r\n"
+                ));
+            }
+            None => {
+                console.print_fmt(format_args!("app[{index}] exited: {code}\r\n"));
+            }
         }
     }
     console.print_fmt(format_args!("Batch complete\r\n"));

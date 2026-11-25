@@ -4,7 +4,7 @@
 
 当前的 [镜像解析器](../kernel/src/batch/image.rs) 已在 `Image::open()` 中校验 CRC，[加载器](../kernel/src/batch/loader.rs) 已按段推进 QSPI 读取偏移，并清零内存中多出来的部分。[内核入口](../kernel/src/main.rs) 通过 `batch::run()` 复用 `loader::load()`。下面按文件说明怎么把这条路径接起来。
 
-本阶段只运行自己构建的整数测试应用。`SVCall` 识别基本异常帧，处理启动、写入和退出。应用使用 PSP 和非特权 Thread mode，内存隔离还需要 MPU。现有 `00hello` 和 `01store_fault` 会调用 `println!`，请用 `APPS=00exit42` 打包本轮镜像。
+本阶段只运行自己构建的整数测试应用。`SVCall` 识别基本异常帧，处理启动、写入和退出。应用使用 PSP 和非特权 Thread mode，MPU 将非特权应用限制在自己的 SRAM 区。现有 `00hello` 和 `01store_fault` 会调用 `println!`，请用 `APPS=00exit42` 打包本轮镜像。
 
 ## 1. 先看清两条栈怎么交接
 
@@ -23,8 +23,6 @@ MSP 是内核和异常处理程序用的栈，PSP 是应用 Thread 用的栈。*
 在 `kernel/src/trap.rs` 写入以下完整内容。
 
 ```rust
-use core::{arch::global_asm, mem::size_of};
-
 #[repr(C)]
 struct BasicExceptionFrame {
     r0: u32,
@@ -42,15 +40,14 @@ unsafe extern "C" {
 }
 
 /// # Safety
-/// 入口和栈顶来自已校验、受信任的 SRAM 应用。
-/// 在使用 MSP 的特权 Thread mode 调用，允许进入 SVCall，且当前无应用运行。
-/// 内核和应用在这条路径上使用基本异常帧。
+/// The entry and stack must belong to the loaded, trusted application.
+/// Call in privileged Thread mode on MSP, with SVC available and no active app.
+/// The kernel and the app must use basic exception frames.
 pub(crate) unsafe fn run_app(entry: u32, stack_top: u32) -> i32 {
     debug_assert_eq!(stack_top & 7, 0);
     debug_assert_ne!(entry & 1, 0);
 
-    let frame =
-        (stack_top as usize - size_of::<BasicExceptionFrame>()) as *mut BasicExceptionFrame;
+    let frame = (stack_top as usize - size_of::<BasicExceptionFrame>()) as *mut BasicExceptionFrame;
 
     unsafe {
         frame.write(BasicExceptionFrame {
@@ -63,12 +60,12 @@ pub(crate) unsafe fn run_app(entry: u32, stack_top: u32) -> i32 {
             pc: entry & !1,
             xpsr: 1 << 24,
         });
-
-        __kr_run_app(frame)
+        APP_ACTIVE.store(true, Ordering::Release);
+        let code = __kr_run_app(frame);
+        APP_ACTIVE.store(false, Ordering::Release);
+        code
     }
 }
-
-global_asm!(include_str!("trap/svc.s"), options(raw));
 ```
 
 - `#[repr(C)]` 固定字段顺序。基本异常帧是八个 32 位字，硬件按这个顺序恢复寄存器。`pc` 位于帧起点 `+0x18`，`xpsr` 位于 `+0x1c`，后面的汇编也用这些偏移取值。
@@ -155,6 +152,9 @@ SVCall:
 
 .Lexit_app:
     ldr     r0, [r0]
+
+.Lfinish_app:
+    @ MSP points to the suspended kernel context. r0 is the run_app result.
     ldmia   sp!, {r3-r11, lr}
     str     r0, [sp]
 
@@ -176,6 +176,55 @@ SVCall:
 .Lunsupported_svc:
     udf     #0
 .size SVCall, . - SVCall
+
+.p2align 2
+.global UsageFault
+.type UsageFault,%function
+.thumb_func
+UsageFault:
+    b       .Lapp_fault
+.size UsageFault, . - UsageFault
+
+.p2align 2
+.global MemoryManagement
+.type MemoryManagement,%function
+.thumb_func
+MemoryManagement:
+    b       .Lapp_fault
+.size MemoryManagement, . - MemoryManagement
+
+.Lapp_fault:
+    @ Only Thread mode with a basic PSP frame can use the app exit path.
+    mvn.w   r1, #2
+    cmp     lr, r1
+    bne     .Lfatal_fault
+
+    @ Rust installs this callback before enabling the configurable faults.
+    ldr     r3, =__kr_app_fault_hook
+    ldr     r3, [r3]
+    cbz     r3, .Lfatal_fault
+    mrs     r0, PSP
+    mrs     r2, IPSR
+    push    {r4, lr}
+    blx     r3
+    ldmia   sp!, {r4, lr}
+
+    cbz     r0, .Lfatal_fault
+    movs    r0, #0
+    b       .Lfinish_app
+
+.Lfatal_fault:
+    b       DefaultHandler
+
+.ltorg
+
+.section .bss.app_fault_hook,"aw",%nobits
+.p2align 2
+.global __kr_app_fault_hook
+.type __kr_app_fault_hook,%object
+__kr_app_fault_hook:
+    .zero 4
+.size __kr_app_fault_hook, . - __kr_app_fault_hook
 ```
 
 ### 3.1 内核进入 `svc #0`
@@ -233,15 +282,14 @@ extern "C" fn __kr_sys_write(addr: u32, len: u32) -> i32 {
 
 检查按固定顺序进行。零长度直接返回 0。超过 128 字节返回 `-90`。其余请求用 `checked_add` 计算排他末地址，区间必须落在 `[APP_START, APP_STACK_TOP)`，溢出或越界返回 `-14`。`try_write(&[u8])` 在短临界区内把合法数据整段复制到 1024 字节队列，返回入队字节数。队列装不下时返回 `-11`，原队列保持不变。`try_print(&str)` 也复用该字节接口，因此内核文本和应用字节按实际入队顺序发送。
 
-范围检查覆盖整块应用 SRAM，包含 PSP 栈和段间空洞。代码依赖受信任的应用传入已初始化字节，运行时隔离仍需 MPU。handler 使用独立的全局队列接口，因此无需取得第二份控制台驱动的可变借用。外层批处理等到应用退出后轮询排空队列，再打印退出码。写入返回 5 表示已接收 5 字节，串口此时仍可能没有输出。 [写入实现](../kernel/src/trap.rs) · [控制台](../kernel/src/drivers/console.rs) · [批处理](../kernel/src/batch.rs)
+范围检查覆盖整块应用 SRAM，包含 PSP 栈和段间空洞。代码依赖受信任的应用传入已初始化字节，当前 MPU 将非特权访问限制在该 SRAM 区，区内权限统一。handler 使用独立的全局队列接口，因此无需取得第二份控制台驱动的可变借用。外层批处理等到应用结束后追加结果日志，再轮询发送。写入返回 5 表示已接收 5 字节，串口此时仍可能没有输出。 [写入实现](../kernel/src/trap.rs) · [控制台](../kernel/src/drivers/console.rs) · [批处理](../kernel/src/batch.rs)
 
 ## 4. 接进批处理循环和内核入口
 
 在 [batch.rs](../kernel/src/batch.rs) 中定义以下函数。它借用已经初始化的 Flash 和控制台驱动，格式化和发送由控制台自己的 `print_fmt()` 完成。
 
 ```rust
-pub(crate) unsafe fn run(
-    flash: &mut W25q64jv,
+pub(crate) unsafe fn run(    flash: &mut W25q64jv,
     console: &mut ConsoleDriver,
 ) -> Result<(), ImageError> {
     let mut image = Image::open(flash)?;
@@ -252,8 +300,27 @@ pub(crate) unsafe fn run(
             let app = loader::load(&mut image, index)?;
             trap::run_app(app.entry, app.stack_top)
         };
-        console.wait_for_write();
-        console.print_fmt(format_args!("app[{index}] exited: {code}\r\n"));
+        match trap::take_app_fault() {
+            Some((pc, cfsr)) => {
+                const DACCVIOL: u32 = 1 << 1;
+                const MMARVALID: u32 = 1 << 7;
+                const UNDEFINSTR: u32 = 1 << 16;
+
+                // MMARVALID 只表示故障地址有效，去掉它再匹配故障原因。
+                let reason = match cfsr & !MMARVALID {
+                    DACCVIOL => "MPU denied data access",
+                    UNDEFINSTR => "undefined instruction",
+                    _ => "unknown fault",
+                };
+
+                console.print_fmt(format_args!(
+                    "app[{index}] faulted: {reason} (pc={pc:#010x})\r\n"
+                ));
+            }
+            None => {
+                console.print_fmt(format_args!("app[{index}] exited: {code}\r\n"));
+            }
+        }
     }
     console.print_fmt(format_args!("Batch complete\r\n"));
     Ok(())
@@ -262,7 +329,7 @@ pub(crate) unsafe fn run(
 
 `Image::open()` 放在循环外，整份镜像只校验一次。应用都链接到 `0x2406_0000`，因此这一轮必须完成「装载 → 执行 → 退出」之后，下一轮才能覆盖 SRAM。镜像或装载错误由 `?` 返回给内核入口。
 
-检查 [main.rs](../kernel/src/main.rs) 模块声明区有 `mod trap;`。在板级初始化和启动日志之后，把 `Board` 持有的 Flash 和控制台句柄交给批处理，并在入口统一报告失败。
+完整的 MPU 初始化与 Fault 恢复见[第二章](chapter-2-batch-system.md)。检查 [main.rs](../kernel/src/main.rs) 模块声明区有 `mod trap;`。在板级初始化和启动日志之后，把 `Board` 持有的 Flash 和控制台句柄交给批处理，并在入口统一报告失败。
 
 ```rust
     // SAFETY: Boot is in privileged Thread mode on MSP. The batch image

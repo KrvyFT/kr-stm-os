@@ -24,6 +24,8 @@
 
 板级代码负责构造驱动，所以批处理接收的是已经初始化的 W25Q64JV 和控制台句柄。应用始终复用同一段 SRAM，`batch` 要等到 `trap::run_app()` 返回后才能装载下一个。 [应用切换和实板验证](svc-app-start-exit.md)
 
+`trap::init_app_faults()` 在批处理前设置应用 MPU 区域并启用 MemManage、UsageFault。通过来源和原因检查的应用故障共享内核恢复路径。 [故障处理与实验](chapter-2-batch-system.md)
+
 ## 链接与内存
 
 Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指令集和硬浮点 ABI。内核的 `build.rs` 只给 `kr-stm-os` 二进制传入 `-Tlink.x`，因此 workspace 中的 `user` 可以定义自己的链接布局。内核的构建脚本把 `kernel/` 加入链接器搜索路径，让 `cortex-m-rt` 的 `link.x` 找到定义以下区域的 `kernel/memory.x`。
@@ -36,7 +38,7 @@ Cargo 默认使用 `thumbv7em-none-eabihf`，对应当前 Cortex-M7 固件的指
 
 panic 缓冲区位于 AXI SRAM 的 `.bss`。如果将来调整链接布局，需要继续把它放在 DMA1 可访问的内存，并保留 32 字节对齐。[DMA 缓冲区与缓存维护](dma-panic.md#3-准备-dma-能读到的消息)
 
-`cargo build --locked -p user_lib --bin 00hello` 生成应用 ELF。内核装载可加载段并设置 PSP，应用从 Rust 的 [`_start`](../user/src/runtime.rs) 进入，调用 `main()`，再把返回值交给 `exit()`。`00hello` 在返回 `47` 前通过 `svc #2` 提交打印。写入结果经 PSP 帧返回应用，应用退出后批处理排空串口队列再打印退出码。
+`cargo build --locked -p user_lib --bin 00hello` 生成应用 ELF。内核装载可加载段并设置 PSP，应用从 Rust 的 [`_start`](../user/src/runtime.rs) 进入，调用 `main()`，再把返回值交给 `exit()`。`00hello` 在返回 `47` 前通过 `svc #2` 提交打印。写入结果经 PSP 帧返回应用，应用结束后批处理提交结果日志并轮询发送。
 
 用户库的 [`lib.rs`](../user/src/lib.rs) 从运行时导出应用使用的 `write` 和 `exit` 接口。[用户态控制台](../user/src/console.rs) 将格式化结果交给 `write`，运行时内部的[系统调用模块](../user/src/runtime/syscall.rs) 处理 SVC 编号和传参寄存器。
 

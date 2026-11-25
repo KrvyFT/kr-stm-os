@@ -56,7 +56,7 @@ Cargo runner 使用 `probe-rs run --chip STM32H743VGTx`。VS Code 可以安装 p
 
 将 MCU 的 PA9 接到 3.3 V USB 转串口的 RX，两侧 GND 相连。只观察输出时，PA10 可以留空。串口终端设为 **19 200 baud、8N1、无流控**。
 
-当前 SVC 支持启动、写入和退出。用 `make pack-apps APPS=00hello` 单独打包打印示例，预期先输出 `Hello World!`，再报告退出码 `47`。 `01store_fault` 应单独检查，应用 Fault 恢复仍待实现。下面是[只返回 42 的测试应用](docs/svc-app-start-exit.md#5-用退出码-42-做第一次验收)的预期日志。
+当前 SVC 支持启动、写入和退出。用 `make pack-apps APPS=00hello` 单独打包打印示例，预期先输出 `Hello World!`，再报告退出码 `47`。 可按 `01store_fault 00hello` 打包，验证 MPU 拒绝写入后批处理能继续，步骤见[第二章](docs/chapter-2-batch-system.md)。下面是[只返回 42 的测试应用](docs/svc-app-start-exit.md#5-用退出码-42-做第一次验收)的预期日志。
 
 ```text
 kr-stm-os booted

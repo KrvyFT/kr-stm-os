@@ -50,7 +50,7 @@
 
 学完这里，应当能从空白的测试文件开始，构造一个整数应用，编译、打包并找到它的 Thumb 入口。把单应用镜像扩大成两项之后，应能解释为什么二者可以共用起始地址，以及为什么不能把它们同时加载到这个地址。到异常部分，要能指出进入内核时哪条栈保存了现场，handler 的 LR 和栈里的 LR 分别属于什么，`svc #0` 与 `svc #1` 如何共享同一个向量。
 
-当前内核已经支持启动、退出和用户态写入。先用纯整数应用定位启动与退出，再用 `00hello` 验证 `svc #2` 和串口发送顺序。 `01store_fault` 需要单独分析，目前内核尚未实现应用 Fault 恢复。 [SVC 汇编](../kernel/src/trap/svc.s)
+当前内核支持启动、退出、用户态写入，以及有限的应用 Fault 恢复。先验证纯退出和 `00hello`，再用 `01store_fault` 验证 MPU 拒绝写入后批处理能够继续。 [SVC 与 Fault 汇编](../kernel/src/trap/svc.s)
 
 测试镜像由自己构建并用已知应用组成。CRC 可以发现内容变化或读取错误，特权状态限制部分硬件操作，MPU 才为具体地址范围提供运行期的访问约束。三者负责不同阶段，合起来才能说明板子运行程序时有怎样的保障。此处先把控制流接通，再逐步加入串口服务、故障归属和内存保护，实验结果要和当前实现区分开。
 
@@ -102,7 +102,7 @@ SVC 有固定的异常入口。当内核和应用各执行一条不同的 `svc` 
 
 应用正在执行时，它的任何一次读写都由 CPU 发出。装载器已经完成了任务，无法再拦截每一条指令。要让它的代码只能访问指定 RAM，就要配 MPU 区域和访问权限。将来在板上验证这项能力时，先让有意越界的测试程序从正确的地址执行，再观察是否触发预期的 Fault。没有这些前置检查，任何早于测试语句的错误都可能被误读为“保护生效了”。类似地，CRC 通过只能表明镜像与其记录的校验值一致，出处与信任策略由烧录流程另外决定。
 
-PCB 和片上的存储区域还会对操作行为产生差异。例如向未映射地址访问，可能以总线错误告终。向确实映射、但被 MPU 禁止的地址访问，则需要按相应的内存管理故障路径判断。当前应用测试里的非法写设计要等故障入口和权限设置之后再作为验收项。先前建立的双应用退出实验可以作为对照组，串口日志、内核状态、批处理推进顺序都可复用到故障实验中。
+当前故障实验在启用 MPU 后执行区外 `strb`。观察 `MemoryManagement`、CFSR 和下一项的退出日志，可以把拒绝访问与批处理恢复分别验证。
 
 ### 2.2.6 对照 RISC-V 时怎样读得更快
 
@@ -134,7 +134,7 @@ rCore 的第二章用 RISC-V 的 U-mode 与 S-mode 描述用户和内核边界�
 | 应用代码、常量和数据 | `[0x2406_0000, 0x2407_F000)` | 124 KiB |
 | 应用 PSP 栈 | `[0x2407_F000, 0x2408_0000)` | 4 KiB |
 
-CPU 取指时使用链接所确定的地址，编译器生成的代码也可能按这些地址找静态数据。固定地址使装载器只需恢复链接器安排的内存内容，省去了动态重定位。让两个应用同时留在相同地址会让后装入者覆盖前者的指令和数据。批处理循环必须等当前应用交回控制权才能重用这一区间。链接脚本里的边界能约束生成的 ELF 及装载器接受的目标范围，运行期间的访存保护还需硬件配置。项目目前没有配置应用 MPU 区域，应用栈也没有由这套常量提供自动溢出保护。 [内核内存布局](../kernel/memory.x) · [应用链接脚本](../user/link.x)
+CPU 取指时使用链接所确定的地址，编译器生成的代码也可能按这些地址找静态数据。固定地址使装载器只需恢复链接器安排的内存内容，省去了动态重定位。让两个应用同时留在相同地址会让后装入者覆盖前者的指令和数据。批处理循环必须等当前应用交回控制权才能重用这一区间。链接脚本里的边界能约束生成的 ELF 及装载器接受的目标范围，运行期间的访存保护还需硬件配置。项目用一个 MPU 区域覆盖应用和栈，二者之间没有独立的栈保护区。 [内核内存布局](../kernel/memory.x) · [应用链接脚本](../user/link.x)
 
 ### 2.3.2 链接脚本描述运行时布局
 
@@ -875,8 +875,7 @@ pub unsafe fn load(image: &mut Image<'_>, index: u32) -> Result<LoadedApp, Image
 ### 2.4.7 生命周期、运行顺序与上一个应用留下的指令
 
 ```rust
-pub(crate) unsafe fn run(
-    flash: &mut W25q64jv,
+pub(crate) unsafe fn run(    flash: &mut W25q64jv,
     console: &mut ConsoleDriver,
 ) -> Result<(), ImageError> {
     let mut image = Image::open(flash)?;
@@ -887,15 +886,34 @@ pub(crate) unsafe fn run(
             let app = loader::load(&mut image, index)?;
             trap::run_app(app.entry, app.stack_top)
         };
-        console.wait_for_write();
-        console.print_fmt(format_args!("app[{index}] exited: {code}\r\n"));
+        match trap::take_app_fault() {
+            Some((pc, cfsr)) => {
+                const DACCVIOL: u32 = 1 << 1;
+                const MMARVALID: u32 = 1 << 7;
+                const UNDEFINSTR: u32 = 1 << 16;
+
+                // MMARVALID 只表示故障地址有效，去掉它再匹配故障原因。
+                let reason = match cfsr & !MMARVALID {
+                    DACCVIOL => "MPU denied data access",
+                    UNDEFINSTR => "undefined instruction",
+                    _ => "unknown fault",
+                };
+
+                console.print_fmt(format_args!(
+                    "app[{index}] faulted: {reason} (pc={pc:#010x})\r\n"
+                ));
+            }
+            None => {
+                console.print_fmt(format_args!("app[{index}] exited: {code}\r\n"));
+            }
+        }
     }
     console.print_fmt(format_args!("Batch complete\r\n"));
     Ok(())
 }
 ```
 
-`batch::run` 在启动时打开镜像，随后按 `0..app_count` 的顺序遍历。它在 `loader::load` 成功后把入口和栈顶交给 `trap::run_app`。当应用通过支持的退出协议交回控制权，Rust 调用产生一个退出码，批循环先排空输出队列，再打印当前索引的结果并继续下一个应用。只要打开、验证或读段有错误，`?` 就退出批处理，`main` 负责报告 `KAPP error`。应用在执行中触发未处理的异常走的是另一条路径。`Batch complete` 只在循环顺利走完时出现，内核入口随后还执行用于演示的 `panic!("Done!")`。`batch::inspect` 可打印镜像条目并检查段。当前内核入口调用的是 `run`，所以普通启动日志不会自动列出整个目录。 [批处理模块](../kernel/src/batch.rs) · [内核入口](../kernel/src/main.rs)
+`batch::run` 在启动时打开镜像，随后按 `0..app_count` 的顺序遍历。它在 `loader::load` 成功后把入口和栈顶交给 `trap::run_app`。当应用通过支持的退出协议交回控制权，Rust 调用产生一个退出码，批循环将当前结果追加到输出队列并发送并继续下一个应用。只要打开、验证或读段有错误，`?` 就退出批处理，`main` 负责报告 `KAPP error`。应用在执行中触发未处理的异常走的是另一条路径。`Batch complete` 只在循环顺利走完时出现，内核入口随后还执行用于演示的 `panic!("Done!")`。`batch::inspect` 可打印镜像条目并检查段。当前内核入口调用的是 `run`，所以普通启动日志不会自动列出整个目录。 [批处理模块](../kernel/src/batch.rs) · [内核入口](../kernel/src/main.rs)
 
 rCore 第二章的应用构建链可以去掉 ELF 外层表示，把裸二进制经汇编 `.incbin` 纳入内核镜像。内核读取 `_num_app` 和应用边界表，求相邻两地址之差获得长度，再装入固定运行区域。`krunix` 也采用在构建脚本里生成 `link_app.S`、把镜像嵌入 `.rodata.apps` 的做法，现有 `load_app` 使用 `0x8040_0000` 和 128 KiB 的固定区，先清整区，再复制当前应用。这里应用目录在片外 NOR，长度直接存在 KAPP 段记录中，每段可有自己的目标地址，装载只清本应用中声明需要补零的尾部。三个系统都依靠同一个批处理条件。各个应用按共同的内存契约构建，由内核确定装入的内容，并安排各应用依次运行。
 
@@ -998,13 +1016,6 @@ PY
 [内核的 `trap.rs`](../kernel/src/trap.rs) 把基本帧写成有固定布局的 Rust 结构，然后借用 C ABI 把指针交给汇编。完整代码如下。
 
 ```rust
-use core::{arch::global_asm, slice};
-
-use crate::{
-    batch::{APP_STACK_TOP, APP_START},
-    drivers::console::{self, MAX_MESSAGE_BYTES, WriteError},
-};
-
 #[repr(C)]
 struct BasicExceptionFrame {
     r0: u32,
@@ -1042,37 +1053,12 @@ pub(crate) unsafe fn run_app(entry: u32, stack_top: u32) -> i32 {
             pc: entry & !1,
             xpsr: 1 << 24,
         });
-        __kr_run_app(frame)
+        APP_ACTIVE.store(true, Ordering::Release);
+        let code = __kr_run_app(frame);
+        APP_ACTIVE.store(false, Ordering::Release);
+        code
     }
 }
-
-#[unsafe(no_mangle)]
-extern "C" fn __kr_sys_write(addr: u32, len: u32) -> i32 {
-    const EAGAIN: i32 = -11;
-    const EFAULT: i32 = -14;
-    const EMSGSIZE: i32 = -90;
-
-    if len == 0 {
-        return 0;
-    }
-    if len as usize > MAX_MESSAGE_BYTES {
-        return EMSGSIZE;
-    }
-    if addr < APP_START || addr.checked_add(len).is_none_or(|end| end > APP_STACK_TOP) {
-        return EFAULT;
-    }
-
-    // SAFETY: The current batch runner admits trusted apps whose sys_write
-    // passes an initialized byte slice. The range check covers code/data and PSP.
-    let bytes = unsafe { slice::from_raw_parts(addr as *const u8, len as usize) };
-    match console::try_write(bytes) {
-        Ok(()) => len as i32,
-        Err(WriteError::TooLong) => EMSGSIZE,
-        Err(WriteError::Full) => EAGAIN,
-    }
-}
-
-global_asm!(include_str!("trap/svc.s"), options(raw));
 ```
 
 `#[repr(C)]` 给这个结构提供可与底层汇编约定的字段顺序。八个字段都是 `u32`，在 Cortex-M7 上按四字节排列，`pc` 是第七个字，偏移是 `6 × 4 = 24`，这正是后面 `[sp, #24]` 或 `[r0, #24]` 的由来。`size_of::<BasicExceptionFrame>()` 用结构本身表达要预留的大小，避免 Rust 建帧和汇编读帧使用不同的数量。与此同时，汇编中的偏移仍是固定常数，因此新增字段或调整顺序都需要重新核对硬件和汇编契约。`frame.write` 把结构值写到原始指针指向的应用栈，适合首次初始化这块存储。调用方需要保证整块内存可写、对齐、位于已经划定的栈内，且此时没有活跃应用占用它。两个 `debug_assert` 分别检查低三位和低一位，帮助开发构建发现不符合契约的栈顶和入口。正式镜像的入口与区域验证由加载链路完成，`debug_assert` 可以在优化构建中去掉。 [镜像验证](../kernel/src/batch/image.rs) · [加载器](../kernel/src/batch/loader.rs)
@@ -1158,6 +1144,9 @@ SVCall:
 
 .Lexit_app:
     ldr     r0, [r0]
+
+.Lfinish_app:
+    @ MSP points to the suspended kernel context. r0 is the run_app result.
     ldmia   sp!, {r3-r11, lr}
     str     r0, [sp]
 
@@ -1179,6 +1168,55 @@ SVCall:
 .Lunsupported_svc:
     udf     #0
 .size SVCall, . - SVCall
+
+.p2align 2
+.global UsageFault
+.type UsageFault,%function
+.thumb_func
+UsageFault:
+    b       .Lapp_fault
+.size UsageFault, . - UsageFault
+
+.p2align 2
+.global MemoryManagement
+.type MemoryManagement,%function
+.thumb_func
+MemoryManagement:
+    b       .Lapp_fault
+.size MemoryManagement, . - MemoryManagement
+
+.Lapp_fault:
+    @ Only Thread mode with a basic PSP frame can use the app exit path.
+    mvn.w   r1, #2
+    cmp     lr, r1
+    bne     .Lfatal_fault
+
+    @ Rust installs this callback before enabling the configurable faults.
+    ldr     r3, =__kr_app_fault_hook
+    ldr     r3, [r3]
+    cbz     r3, .Lfatal_fault
+    mrs     r0, PSP
+    mrs     r2, IPSR
+    push    {r4, lr}
+    blx     r3
+    ldmia   sp!, {r4, lr}
+
+    cbz     r0, .Lfatal_fault
+    movs    r0, #0
+    b       .Lfinish_app
+
+.Lfatal_fault:
+    b       DefaultHandler
+
+.ltorg
+
+.section .bss.app_fault_hook,"aw",%nobits
+.p2align 2
+.global __kr_app_fault_hook
+.type __kr_app_fault_hook,%object
+__kr_app_fault_hook:
+    .zero 4
+.size __kr_app_fault_hook, . - __kr_app_fault_hook
 ```
 
 入口用原始汇编提供 Handler 的原因与执行顺序有关。`SVCall` 一进门，`sp` 与 `lr` 都有硬件定义的特殊用途。普通 Rust 函数可能为建立函数栈而修改 `sp`，还可能在调用其他函数时覆盖 `lr`。如果先让编译器生成函数序言，再照抄 `[sp, #24]`，读到的就可能是普通函数的局部数据。汇编先按约定保存现场并确定帧基址，再根据需要引入 Rust 分发函数，才有一条可核对的 ABI 边界。启动和退出由汇编直接完成。写入分支保存现场后用 C ABI 调用 Rust。 [异常汇编](../kernel/src/trap/svc.s)
@@ -1298,7 +1336,7 @@ extern "C" fn __kr_sys_write(addr: u32, len: u32) -> i32 {
 
 检查按固定顺序进行。零长度直接返回 0。超过 128 字节返回 `-90`。其余请求用 `checked_add` 计算排他末地址，区间必须落在 `[APP_START, APP_STACK_TOP)`，溢出或越界返回 `-14`。`try_write(&[u8])` 在短临界区内把合法数据整段复制到 1024 字节队列，返回入队字节数。队列装不下时返回 `-11`，原队列保持不变。`try_print(&str)` 也复用该字节接口，因此内核文本和应用字节按实际入队顺序发送。
 
-范围检查覆盖整块应用 SRAM，包含 PSP 栈和段间空洞。代码依赖受信任的应用传入已初始化字节，运行时隔离仍需 MPU。handler 使用独立的全局队列接口，因此无需取得第二份控制台驱动的可变借用。外层批处理等到应用退出后轮询排空队列，再打印退出码。写入返回 5 表示已接收 5 字节，串口此时仍可能没有输出。 [写入实现](../kernel/src/trap.rs) · [控制台](../kernel/src/drivers/console.rs) · [批处理](../kernel/src/batch.rs)
+范围检查覆盖整块应用 SRAM，包含 PSP 栈和段间空洞。代码依赖受信任的应用传入已初始化字节，现有 MPU 提供应用 SRAM 与内核区的基础隔离，区内权限仍是统一的。handler 使用独立的全局队列接口，因此无需取得第二份控制台驱动的可变借用。外层批处理在应用结束后将结果日志入队，由 `print_fmt()` 轮询发送。写入返回 5 表示已接收 5 字节，串口此时仍可能没有输出。 [写入实现](../kernel/src/trap.rs) · [控制台](../kernel/src/drivers/console.rs) · [批处理](../kernel/src/batch.rs)
 
 ### 2.5.9 对照 krunix 和 rCore 的控制流
 
@@ -1322,7 +1360,7 @@ RISC-V 启动应用时，在内核栈上准备 `TrapContext`，将 `x[2]` 设为
 
 以两边的写服务为例，krunix 的用户库让 `a7 = 64`，并将文件描述符、地址和长度放在 `a0`、`a1` 和 `a2`。内核从 `x[17]` 取得编号，从 `x[10..=12]` 取得三项数据，`sys_write` 检查这条路径支持的标准输出描述符并打印 UTF-8，结果写回 `x[10]`。普通 `ecall` 的返回要先使 `cx.sepc += 4`，否则 `sret` 又回到 `ecall`。kr-stm-os 用户库生成 `svc #2`，当前接口只传地址和长度，序号在机器码的低八位。将在 PSP 帧中读 `[frame]`、`[frame + 4]`，将结果写 `[frame]`。`frame.pc - 2` 只用于定位 SVC 编码，直接保存原 PC 才能让调用恢复在下一条指令。如果仿照 RISC-V 再给压栈 PC 加四，就会跳过应用汇编之后的一部分指令。若错误写回 `frame.pc - 2`，恢复的应用会反复执行 SVC。 [rCore 的陷阱分发与系统调用](https://rcore-os.cn/rCore-Tutorial-Book-v3/chapter2/4trap-handling.html#id9) · [STM32 用户 ABI](../user/src/runtime/syscall.rs)
 
-退出也体现了两种批处理组织。krunix 用 `a7 = 93` 请求退出，`sys_exit` 直接调用 `run_next_app() -> !`，它在处理路径中加载下一个应用并切换到新 `TrapContext`。krunix 的 `StoreFault`、`StorePageFault` 和 `IllegalInstruction` 也有显式分支，会报告后尝试运行下一个应用。kr-stm-os 使用暂停内核 Thread 的方式运行本轮应用，关键是等退出后收回原硬件帧，再回到 Rust 的 `for` 循环。它目前没有走故障恢复来执行下一应用的分支。两套系统都复用用户执行区，但一套将推进批次放在陷阱处理路径里，另一套在调用装载器的原控制流中推进。对照源码时可追踪“结束后谁拿到控制权”。它决定退出码写到哪里，以及内核需要保存怎样的后续状态。 [rCore 的应用执行](https://rcore-os.cn/rCore-Tutorial-Book-v3/chapter2/4trap-handling.html#ch2-app-execution) · [STM32 批处理循环](../kernel/src/batch.rs)
+退出也体现了两种批处理组织。krunix 用 `a7 = 93` 请求退出，`sys_exit` 直接调用 `run_next_app() -> !`，它在处理路径中加载下一个应用并切换到新 `TrapContext`。krunix 的 `StoreFault`、`StorePageFault` 和 `IllegalInstruction` 也有显式分支，会报告后尝试运行下一个应用。kr-stm-os 使用暂停内核 Thread 的方式运行本轮应用，关键是等退出后收回原硬件帧，再回到 Rust 的 `for` 循环。两类可恢复的应用 Fault 也经同一恢复路径回到外层循环。两套系统都复用用户执行区，但一套将推进批次放在陷阱处理路径里，另一套在调用装载器的原控制流中推进。对照源码时可追踪“结束后谁拿到控制权”。它决定退出码写到哪里，以及内核需要保存怎样的后续状态。 [rCore 的应用执行](https://rcore-os.cn/rCore-Tutorial-Book-v3/chapter2/4trap-handling.html#ch2-app-execution) · [STM32 批处理循环](../kernel/src/batch.rs)
 
 ### 2.5.10 当前切换协议的适用边界
 
@@ -1331,6 +1369,114 @@ RISC-V 启动应用时，在内核栈上准备 `TrapContext`，将 `x[2]` 设为
 浮点也是一条明确的边界。Rust 编译目标是 `thumbv7em-none-eabihf`，`eabihf` 描述面向硬件浮点的 ABI，而异常发生时处理器是否采用扩展帧由实际浮点上下文决定。即使本轮应用用的主要是整数，也要考虑启动环境或服务代码是否使浮点上下文变为活跃。当前 Handler 用完整的 `EXC_RETURN` 与两个基本帧令牌比较，因此扩展帧会进入未支持路径。若扩展为支持浮点，需要一并决定保存并恢复哪些浮点寄存器，如何处理惰性压栈，以及从被暂停的一侧恢复怎样的状态。仅接受更多的 `EXC_RETURN` 常量会绕过当前检查，但不能给这套人工构造的帧添加缺少的浮点状态。 [目标配置](../.cargo/config.toml) · [Arm Cortex-M7 浮点异常上下文](https://documentation-service.arm.com/static/61efd8352dd99944d05142d1?token=)
 
 退出服务当前直接读取 PSP 帧和帧内 PC 对应的半字，适用于项目要求的可信测试应用。要对外接收独立构建的应用，特权 Handler 读取用户提供的信息前应验证帧所在区间及 PC 对应的可执行范围，并处理 PSP 溢出、异常压栈未完成、非法指令和未知服务。找到代码范围后，仍需在减二前检查地址下界，避免针对无效 PC 的半字加载触发第二个异常。若准备从应用 Fault 回到批处理，必须区分故障来自用户 Thread、内核 Thread 还是 Handler，并验证可用的内核现场仍完整。来自内核的故障需要保留诊断语义，来自应用且允许回收的故障才适合转成应用失败。建立这条边界后，后续扩展写入、故障终止或调度时，都能明确回答三件事：现场从哪条栈读，结果写回哪一份帧，异常最终返回哪个 Thread。 [当前 SVC 处理](../kernel/src/trap/svc.s) · [Arm Cortex-M7 Fault 状态与栈错误](https://documentation-service.arm.com/static/61efd8352dd99944d05142d1?token=)
+
+### 2.5.11 用 MPU 限制应用，并从已识别的 Fault 恢复
+
+`main()` 在调用 `batch::run()` 前执行 `trap::init_app_faults()`。它先安装 Rust 回调，然后打开 `SHCSR` 中的 MemManage 与 UsageFault 使能位。先安装回调可以让异常入口识别已就绪的处理函数。汇编中的 `ldr r3, =__kr_app_fault_hook` 取得槽地址，第二次读取才拿到可调用的函数指针。空槽直接走 `DefaultHandler`，并不会把地址零当成入口。
+
+```rust
+pub(crate) fn init_app_faults() {
+    const MEMFAULTENA: u32 = 1 << 16;
+    const USGFAULTENA: u32 = 1 << 18;
+
+    // Install the handler before a configurable fault can reach it.
+    unsafe {
+        __kr_app_fault_hook = Some(handle_app_fault);
+        asm::dsb();
+        (*SCB::PTR)
+            .shcsr
+            .modify(|value| value | MEMFAULTENA | USGFAULTENA);
+    }
+    init_app_mpu();
+}
+
+fn init_app_mpu() {
+    const REGION_SIZE: u32 = APP_STACK_TOP - APP_START;
+    const _: () = assert!(REGION_SIZE.is_power_of_two() && APP_START % REGION_SIZE == 0);
+    const RASR_SIZE: u32 = (REGION_SIZE.ilog2() - 1) << 1;
+    const RASR_ENABLE: u32 = 1;
+    const RASR_FULL_ACCESS: u32 = 0b011 << 24;
+    const RASR_NORMAL_WB_WA: u32 = (1 << 19) | (1 << 17) | (1 << 16);
+    const MPU_ENABLE: u32 = 1;
+    const MPU_PRIVDEFENA: u32 = 1 << 2;
+
+    // The app has one region for its code, data, and PSP stack. The kernel
+    // uses the default privileged map for flash, its own RAM, and devices.
+    let mpu = unsafe { &*MPU::PTR };
+    let regions = (mpu._type.read() >> 8) & 0xff;
+    assert!(regions != 0, "application isolation requires an MPU");
+
+    asm::dsb();
+    unsafe {
+        mpu.ctrl.write(0);
+        // An inherited region must not grant the app access outside its slot.
+        for region in 0..regions {
+            mpu.rnr.write(region);
+            mpu.rasr.write(0);
+        }
+        mpu.rnr.write(0);
+        mpu.rbar.write(APP_START);
+        mpu.rasr
+            .write(RASR_FULL_ACCESS | RASR_NORMAL_WB_WA | RASR_SIZE | RASR_ENABLE);
+        mpu.ctrl.write(MPU_ENABLE | MPU_PRIVDEFENA);
+    }
+    asm::dsb();
+    asm::isb();
+}
+```
+
+MPU 的应用区是 `[0x24060000, 0x24080000)`，大小 128 KiB，起点按区大小对齐。它覆盖 124 KiB 装载区和 4 KiB PSP 栈。代码先关闭 MPU 并清除继承的区域，再设置区域 0，避免旧区域额外授予权限。`AP=0b011` 允许特权和非特权读写，未设置 XN，因此该区也可执行。32 位地址空间内，内核可通过 `PRIVDEFENA` 使用默认特权内存图。应用区以外的地址不会因此授权给非特权应用。当前是一整块可读、可写、可执行区域，代码与栈的权限尚未细分。`DSB` 和 `ISB` 让配置更新在后续访存和取指前生效。
+
+发生故障时，向量 `MemoryManagement` 或 `UsageFault` 进入共享的 `.Lapp_fault`。汇编先检查 `LR = 0xffff_fffd`，拒绝 Handler、MSP 和扩展帧，然后用 `PSP`、`EXC_RETURN`、`IPSR` 调用回调。调用前压入 `{r4, lr}`，维持调用栈对齐并保留异常返回令牌。Rust 再检查 `APP_ACTIVE`、PSP 八字节对齐，以及基本帧是否完整落在保留的应用栈中。只有通过检查，才从帧里读 PC。
+
+```rust
+extern "C" fn handle_app_fault(psp: u32, exc_return: u32, exception: u32) -> u32 {
+    const UNDEFINSTR: u32 = 1 << 16;
+    const DACCVIOL: u32 = 1 << 1;
+    const MMARVALID: u32 = 1 << 7;
+
+    let last_frame_start = APP_STACK_TOP - size_of::<BasicExceptionFrame>() as u32;
+    if !APP_ACTIVE.load(Ordering::Acquire)
+        || exc_return != 0xffff_fffd
+        || psp & 7 != 0
+        || !(APP_END..=last_frame_start).contains(&psp)
+    {
+        return 0;
+    }
+
+    let scb = unsafe { &*SCB::PTR };
+    let cfsr = scb.cfsr.read();
+    let recoverable = match exception {
+        6 => cfsr == UNDEFINSTR,
+        4 => (cfsr & !MMARVALID) == DACCVIOL,
+        _ => false,
+    };
+    if !recoverable {
+        return 0;
+    }
+
+    let frame = psp as *const BasicExceptionFrame;
+    let pc = unsafe { core::ptr::addr_of!((*frame).pc).read_volatile() };
+    FAULT_PC.store(pc, Ordering::Relaxed);
+    FAULT_CFSR.store(cfsr, Ordering::Release);
+
+    // CFSR is write-one-to-clear. Do not leave these flags for the next app.
+    unsafe { scb.cfsr.write(cfsr) };
+    asm::dsb();
+    1
+}
+
+pub(crate) fn take_app_fault() -> Option<(u32, u32)> {
+    let cfsr = FAULT_CFSR.swap(0, Ordering::AcqRel);
+    (cfsr != 0).then(|| (FAULT_PC.load(Ordering::Relaxed), cfsr))
+}
+```
+
+回调只接受两种 CFSR 状态。MemManage（异常 4）忽略 `MMARVALID` 后必须恰好是 `DACCVIOL`，因为前者只标记故障地址有效。UsageFault（异常 6）必须恰好是 `UNDEFINSTR`。混合原因、栈入栈失败、HardFault 以及无法归属应用的异常，都不进入恢复路径。未知 SVC 在 Handler 内执行 `udf`，也不等同于应用 Thread 自己执行未定义指令。
+
+接受后，回调保存故障指令的 PC 和原始 CFSR，以写一清零的方式清除已记录的标志。汇编把 `r0` 设为 0 并跳到 `.Lfinish_app`，复用正常退出时恢复 MSP 的代码。它丢弃应用现场，应用不会重试故障指令。回到 Rust 后，`APP_ACTIVE` 关闭，批处理以 `take_app_fault()` 取走本轮故障记录。这个机制让占位返回值 0 与正常退出 0 可区分，也防止下一轮误读上一轮故障。当前日志会把 `DACCVIOL` 映射为 `MPU denied data access`、把 `UNDEFINSTR` 映射为 `undefined instruction`。 [初始化与故障判断](../kernel/src/trap.rs) · [异常入口](../kernel/src/trap/svc.s) · [日志分派](../kernel/src/batch.rs)
+
+本轮工作树里的批处理直接调用 `print_fmt()`，先把结果日志加入队列，再轮询发送。短应用的日志与结果可以按入队顺序发送。若应用此前已经填满 1024 字节队列，结果日志的新请求可能因容量不足触发 `unwrap()` panic，当前路径没有在提交结果日志前预排空。这个边界与 MPU 恢复本身是两件事。
 
 ## 2.6 逐步验证与板上实验
 
@@ -1510,7 +1656,7 @@ Batch complete
 Panicked at kernel/src/main.rs:<行号> Done!
 ```
 
-在 `main()` 中，`batch::run()` 返回后会故意调用 `panic!("Done!")`，用来演示 panic DMA，因而把 `Batch complete` 作为批处理的成功信号。即使镜像解析返回错误，`main()` 也会先打印 `KAPP error: ...`，然后执行同一个 `Done!`。孤立的一行 panic 文本因此无法证明应用已经运行。应用执行不合法指令或发起未知 SVC时，则由处理器走 Fault 路径，内核目前没有应用 Fault 恢复和跳到下一项的逻辑。遇到静默停机应检查当前 PC 和异常寄存器。 [内核入口](../kernel/src/main.rs) · [panic 处理](../kernel/src/panic_handler.rs) · [SVC 分派](../kernel/src/trap/svc.s)
+在 `main()` 中，`batch::run()` 返回后会故意调用 `panic!("Done!")`，用来演示 panic DMA，因而把 `Batch complete` 作为批处理的成功信号。即使镜像解析返回错误，`main()` 也会先打印 `KAPP error: ...`，然后执行同一个 `Done!`。孤立的一行 panic 文本因此无法证明应用已经运行。应用执行不合法指令或发起未知 SVC时，则由处理器走 Fault 路径，当前只对来源和状态都通过检查的应用 Fault 恢复，其他故障走诊断路径。遇到静默停机应检查当前 PC 和异常寄存器。 [内核入口](../kernel/src/main.rs) · [panic 处理](../kernel/src/panic_handler.rs) · [SVC 分派](../kernel/src/trap/svc.s)
 
 ### 2.6.4 跟着断点确认栈与异常返回
 
@@ -1609,7 +1755,7 @@ app[0] exited: 47
 Batch complete
 ```
 
-`01store_fault` 会先尝试把两条日志入队，但随后的非法写入可能在排空队列前触发 Fault。队列中有字节并不保证已发送，源码末尾的 `57` 也只有在函数实际返回时才会成为退出码。
+`01store_fault` 的详细故障实验见 2.6.8。
 
 ### 2.6.7 按最早失败的检查点定位
 
@@ -1629,6 +1775,30 @@ Batch complete
 如果出现 Fault，在已连接的调试器上记录 `HFSR`（`0xe000ed2c`）及 `CFSR`（`0xe000ed28`），注意故障状态位可能粘滞，独立实验用复位建立干净起点。有的后端支持 Fault vector catch，也可以在当前 ELF 里存在的 `HardFault` 或 `DefaultHandler` 符号上设置断点。`HFSR.FORCED` 表示故障升级时，继续读 `CFSR` 找根因。只有在 `BFARVALID` 或 `MMARVALID` 置位时，分别使用 `BFAR` 或 `MMFAR` 中的地址。若故障发生在 SVC Handler 中执行 `udf`，Fault 这一次的帧和应用进入 SVC 时保存的 PSP 帧是两个层次。开头的寄存器快照和异常返回值有助于避免把 Handler 自己的故障 PC 当成用户入口。 [应用启动与退出指南](svc-app-start-exit.md#6-在调试器里逐站验证) · [Arm Cortex-M7 异常模型](https://support.arm.com/documentation/dui0646/a/The-Cortex-M7-Processor/Exception-model/Exception-entry-and-return)
 
 完成一轮实验后，记录仓库版本与工作树状态、构建 profile、三个镜像的顺序和 CRC、板卡与 loader 配置、串口输出以及两次 SVC 的核心值。还要记下验证停在哪一层。主机工具可以证明应用 ELF 与 KAPP 一致，串口可以观察整条路径，读回能确认 flash 字节，调试断点能核对运行上下文。缺少板卡或探针时，前两小节和以下主机练习可以独立进行，结果写成主机构建与文件校验即可。
+
+### 2.6.8 先让一个应用触发 MPU，再运行下一个
+
+将故障应用放在 `00hello` 之前，以不同的观测结果验证批处理继续运行。先按前面的步骤确认板型、外部 loader 和目标扇区，再使用下面的镜像。
+
+```bash
+make build
+make pack-apps APPS='01store_fault 00hello' QSPI_IMAGE=output/ch2/fault-then-hello.img
+make qspi-write QSPI_IMAGE=output/ch2/fault-then-hello.img
+make flash-kernel
+```
+
+`01store_fault` 先打印一条测试说明，再用内联汇编 `strb` 向 `0x00010000` 写一个字节。它位于应用 MPU 区之外。预计从 `MemoryManagement` 经回调终止程序，然后继续装载 `00hello`。`57` 表示测试写入意外成功并走到正常返回，用来与故障结果区分。
+
+```text
+kr-stm-os booted
+Testing an MPU-protected write to 0x00010000
+app[0] faulted: MPU denied data access (pc=<strb 的地址>)
+Hello World!
+app[1] exited: 47
+Batch complete
+```
+
+若有断点，核对 `MemoryManagement` 入口的 `LR=0xffff_fffd`、`IPSR=4` 和 PSP 基本帧范围，在 Rust 回调清除 CFSR 之前检查 `DACCVIOL`。保存的 PC 应指向 `01store_fault` 的 `strb`，可用该应用的 ELF 反汇编核对。随后观察批处理先记录故障，再装载下一项。上面的日志和寄存器值是验收预期。 [故障测试应用](../user/src/bin/01store_fault.rs)
 
 ## 2.7 练习与参考答案
 
@@ -1730,7 +1900,7 @@ PY
 
 连接实板后，再用一个受信任的应用先写短消息，再依据返回值选用不同退出码。断点应依次遇到启动、写入、退出，`svc #2` 后的应用 PC 和 PSP 应恢复，最终 `svc #1` 仍能把退出码传回内核。可以让应用调用后立刻改写自己的缓冲区，观察串口是否仍发出入队前的数据，以检验队列持有独立副本。对跨界和溢出等参数，主机纯函数测试可以验证拒绝路径，板上测试可由专用测试入口传入整数参数，避免 Rust 先尝试构造无效引用。针对 Handler 返回路径，应再在用户代码中加入能够检查活跃寄存器的受控测试，确保跨 `svc #2` 保留 ABI 承诺的上下文。
 
-这些约束防止写服务代为读取未获准的内存。应用还可自行执行 load 和 store，因此 MPU 需要另外配置区域访问权限，保护内核 RAM、控制寄存器和设备，把批处理进程可直接访问的区域限制在它拥有的内存。等 MPU 和 Fault 策略具备以后，再验证访问违规的应用能否被终止并交回调度。只用退出码 `42` 验证的当前阶段，应用使用非特权 PSP 的事实可由断点证实，内存访问隔离和 Fault 恢复仍是后续工作。 [应用启动与退出指南](svc-app-start-exit.md) · [MPU 与 Fault 的实施顺序](batch-implementation.md#54-irqfaultmpu-和抢占的先后)
+当前 MPU 负责应用和内核的地址隔离，写入服务仍需独立验证指针与长度，因为 handler 会以特权访问这些地址。恢复行为见 2.5.11，板上对照实验见 2.6.8。
 
 ### 2.7.6 题六　提交可复现的实验记录
 
@@ -1773,7 +1943,7 @@ PY
 
 特权层回答“这时 CPU 允许以什么权限执行”。非特权 Thread mode、PSP 与明确的 SVC 入口建立了普通应用和内核服务的边界。MPU 的作用是进一步限制应用能访问的具体内存与设备。装载时的区域划分同时是未来配置 MPU 时的基础。应用代码和数据是否用不同权限，要取决于最终采用怎样的区域划分、对齐，以及它是否真的覆盖链接脚本安排的地址。验收时应同时检查链接地址、实际 MPU 寄存器值和出错现场，不能由一个预想中的 Fault 就推断权限表已正确应用。
 
-故障恢复层回答“这次异常结束后还能继续哪个程序”。即使能检测到应用触发了访存错误，也要先看异常来源和现场是否可信。如果错误发生于应用运行时，而且有可靠的 PSP 帧，可以设计恢复 MSP 上的内核现场，由批处理记录结束原因。如果错误发生于内核或异常栈压入过程，现场可能已损坏，就需要更加保守的诊断流程。当前仓库的 `SVCall` 负责可预期的启动、写入与退出。把应用故障恢复列为单独工作，有助于保留现在能验证的成功路径，并为新异常找到可观测的验收标准。 [后续 MPU 与 Fault 规划](batch-implementation.md#54-irqfaultmpu-和抢占的先后)
+故障恢复层决定异常后能否继续批处理。当前实现只接受基本 PSP 帧上的 `DACCVIOL` 或 `UNDEFINSTR`，经 `.Lfinish_app` 恢复 MSP。其他来源或原因由默认异常路径处理。
 
 ### 2.8.4 同一个应用槽要怎样扩展
 
@@ -1787,7 +1957,7 @@ PY
 
 实验记录应同时描述输入和观测结果。记录固件源码版本、目标名、构建配置、应用 ELF 文件名和打包参数。单应用镜像测试时写明只有哪个应用，双应用测试时写明确切顺序，必要时附上镜像尺寸与校验结果。这样串口显示 42 与 7 时，另一位读者能够从镜像输入重现顺序，而不用猜测机器里还留着哪次的烧录产物。若保留两份镜像作对照，文件名可以直接包含它们对应的单应用、正序和倒序用途。
 
-对寄存器截图也应注明断点所在指令。写“在 `SVCall` 看到 PSP 为某值”不够，因为 handler 会命中两次，而且启动分支会主动修改 PSP。写“首次进入 `SVCall`、执行第一条指令前”和“启动分支 `bx lr` 之前”，就能精确说明当时保存的是哪一方。记下每处的 LR、PC、MSP、PSP，以及感兴趣的帧槽。把屏幕上的地址换算成帧起点加偏移，便于别人即使使用不同的栈地址，也能核对相同的逻辑。
+对寄存器截图也应注明断点所在指令。写“在 `SVCall` 看到 PSP 为某值”不够，因为仅退出的实验会命中两次，启用写入的应用还会命中更多次，且启动分支会主动修改 PSP。写“首次进入 `SVCall`、执行第一条指令前”和“启动分支 `bx lr` 之前”，就能精确说明当时保存的是哪一方。记下每处的 LR、PC、MSP、PSP，以及感兴趣的帧槽。把屏幕上的地址换算成帧起点加偏移，便于别人即使使用不同的栈地址，也能核对相同的逻辑。
 
 主机构建验证和板上观测按各自证据记录。主机能确认 ELF 入口、段属性、符号和镜像次序，板上调试能确认实际 Flash、SRAM 和 CPU 模式。未烧录时，示例串口文本是验收预期。只要报告清楚已经做到的层次，就可以在下一轮专门追踪缺少证据的部分，避免把“构建成功”误当成“已经验证异常返回”。
 
