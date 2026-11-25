@@ -14,6 +14,7 @@ use crate::{board::Board, drivers::console};
 #[entry]
 fn main() -> ! {
     let mut board = Board::init();
+    trap::init_app_faults();
 
     let _ = console::try_print("\r\nkr-stm-os booted\r\n");
     board.led.set_low();

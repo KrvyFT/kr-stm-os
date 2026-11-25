@@ -1,9 +1,117 @@
-use core::{arch::global_asm, slice};
+use core::{
+    arch::global_asm,
+    slice,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+};
+use cortex_m::{
+    asm,
+    peripheral::{MPU, SCB},
+};
 
 use crate::{
-    batch::{APP_STACK_TOP, APP_START},
+    batch::{APP_END, APP_STACK_TOP, APP_START},
     drivers::console::{self, MAX_MESSAGE_BYTES, WriteError},
 };
+
+static APP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static FAULT_PC: AtomicU32 = AtomicU32::new(0);
+static FAULT_CFSR: AtomicU32 = AtomicU32::new(0);
+
+type AppFaultHook = extern "C" fn(u32, u32, u32) -> u32;
+
+unsafe extern "C" {
+    static mut __kr_app_fault_hook: Option<AppFaultHook>;
+}
+
+pub(crate) fn init_app_faults() {
+    const MEMFAULTENA: u32 = 1 << 16;
+    const USGFAULTENA: u32 = 1 << 18;
+
+    // Install the handler before a configurable fault can reach it.
+    unsafe {
+        __kr_app_fault_hook = Some(handle_app_fault);
+        asm::dsb();
+        (*SCB::PTR)
+            .shcsr
+            .modify(|value| value | MEMFAULTENA | USGFAULTENA);
+    }
+    init_app_mpu();
+}
+
+fn init_app_mpu() {
+    const REGION_SIZE: u32 = APP_STACK_TOP - APP_START;
+    const _: () = assert!(REGION_SIZE.is_power_of_two() && APP_START % REGION_SIZE == 0);
+    const RASR_SIZE: u32 = (REGION_SIZE.ilog2() - 1) << 1;
+    const RASR_ENABLE: u32 = 1;
+    const RASR_FULL_ACCESS: u32 = 0b011 << 24;
+    const RASR_NORMAL_WB_WA: u32 = (1 << 19) | (1 << 17) | (1 << 16);
+    const MPU_ENABLE: u32 = 1;
+    const MPU_PRIVDEFENA: u32 = 1 << 2;
+
+    // The app has one region for its code, data, and PSP stack. The kernel
+    // uses the default privileged map for flash, its own RAM, and devices.
+    let mpu = unsafe { &*MPU::PTR };
+    let regions = (mpu._type.read() >> 8) & 0xff;
+    assert!(regions != 0, "application isolation requires an MPU");
+
+    asm::dsb();
+    unsafe {
+        mpu.ctrl.write(0);
+        // An inherited region must not grant the app access outside its slot.
+        for region in 0..regions {
+            mpu.rnr.write(region);
+            mpu.rasr.write(0);
+        }
+        mpu.rnr.write(0);
+        mpu.rbar.write(APP_START);
+        mpu.rasr
+            .write(RASR_FULL_ACCESS | RASR_NORMAL_WB_WA | RASR_SIZE | RASR_ENABLE);
+        mpu.ctrl.write(MPU_ENABLE | MPU_PRIVDEFENA);
+    }
+    asm::dsb();
+    asm::isb();
+}
+
+extern "C" fn handle_app_fault(psp: u32, exc_return: u32, exception: u32) -> u32 {
+    const UNDEFINSTR: u32 = 1 << 16;
+    const DACCVIOL: u32 = 1 << 1;
+    const MMARVALID: u32 = 1 << 7;
+
+    let last_frame_start = APP_STACK_TOP - size_of::<BasicExceptionFrame>() as u32;
+    if !APP_ACTIVE.load(Ordering::Acquire)
+        || exc_return != 0xffff_fffd
+        || psp & 7 != 0
+        || !(APP_END..=last_frame_start).contains(&psp)
+    {
+        return 0;
+    }
+
+    let scb = unsafe { &*SCB::PTR };
+    let cfsr = scb.cfsr.read();
+    let recoverable = match exception {
+        6 => cfsr == UNDEFINSTR,
+        4 => (cfsr & !MMARVALID) == DACCVIOL,
+        _ => false,
+    };
+    if !recoverable {
+        return 0;
+    }
+
+    let frame = psp as *const BasicExceptionFrame;
+    let pc = unsafe { core::ptr::addr_of!((*frame).pc).read_volatile() };
+    FAULT_PC.store(pc, Ordering::Relaxed);
+    FAULT_CFSR.store(cfsr, Ordering::Release);
+
+    // CFSR is write-one-to-clear. Do not leave these flags for the next app.
+    unsafe { scb.cfsr.write(cfsr) };
+    asm::dsb();
+    1
+}
+
+pub(crate) fn take_app_fault() -> Option<(u32, u32)> {
+    let cfsr = FAULT_CFSR.swap(0, Ordering::AcqRel);
+    (cfsr != 0).then(|| (FAULT_PC.load(Ordering::Relaxed), cfsr))
+}
 
 #[repr(C)]
 struct BasicExceptionFrame {
@@ -42,7 +150,10 @@ pub(crate) unsafe fn run_app(entry: u32, stack_top: u32) -> i32 {
             pc: entry & !1,
             xpsr: 1 << 24,
         });
-        __kr_run_app(frame)
+        APP_ACTIVE.store(true, Ordering::Release);
+        let code = __kr_run_app(frame);
+        APP_ACTIVE.store(false, Ordering::Release);
+        code
     }
 }
 
